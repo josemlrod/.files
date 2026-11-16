@@ -77,7 +77,44 @@ rex.bind(P .. "tab", "pane.focus_next")            -- TUI extra
 rex.bind(P .. "shift+tab", "pane.focus_previous") -- TUI extra
 rex.bind(P .. "v", "pane.split.right")
 rex.bind(P .. "-", "pane.split.down")
-rex.bind(P .. "x", "pane.close")
+-- ctrl+f x closes the pane. On the last pane in the tab, pane.close does
+-- nothing, so close the whole tab instead.
+rex.action{
+  name = "herdr_pane_close",
+  title = "Close Pane, or Tab if Last Pane",
+  category = "Pane",
+  run = function(ctx)
+    local view, err = rex.call("session.view", { session_id = ctx.session_id })
+    if not view then error(err) end
+
+    -- Find the tab holding the pane the key was pressed in. Fall back to the
+    -- active tab if Rex didn't pass a pane.
+    local tab
+    for _, w in ipairs(view.windows or {}) do
+      if ctx.block_id == nil and w.window_id == view.active_window_id then
+        tab = w
+      end
+      for _, layer in ipairs(w.layers or {}) do
+        for _, b in ipairs(layer.blocks or {}) do
+          if b.block_id == ctx.block_id then tab = w end
+        end
+      end
+    end
+
+    -- Count panes across every layer, floating ones included.
+    local panes = 0
+    for _, layer in ipairs(tab and tab.layers or {}) do
+      panes = panes + #(layer.blocks or {})
+    end
+
+    if panes <= 1 then
+      rex.client.queue("client.tab.close", {})
+    else
+      rex.client.queue("pane.close", {})
+    end
+  end,
+}
+rex.bind(P .. "x", "herdr_pane_close")
 rex.bind(P .. "z", "pane.zoom")
 rex.bind(P .. "shift+p", "pane.rename")           -- TUI extra
 rex.bind(P .. "b", "client.sidebar.toggle")
