@@ -17,6 +17,7 @@ import argparse
 import datetime
 import json
 import os
+import shlex
 import shutil
 import sys
 from pathlib import Path
@@ -36,10 +37,12 @@ LOCAL_RULES = HOME / "knowledge" / "review" / "local" / "rules.md"
 GIT_HOOKS = HOME / ".agents" / "git-hooks"
 DISPATCH = HOME / ".agents" / "review" / "git-hooks" / "_dispatch"
 STUB_NAME = "_run"
-STUB = """#!/bin/sh
+# The absolute path is written in at install time so hooks keep working when a
+# command changes HOME (test suites often do).
+STUB = f"""#!/bin/sh
 # Written by ~/.files/agents/install.py. Every git hook name here links to this file.
 REVIEW_HOOK_NAME=$(basename "$0") REVIEW_HOOK_DIR=$(cd "$(dirname "$0")" && pwd -P) \\
-  exec "$HOME/.agents/review/git-hooks/_dispatch" "$@"
+  exec {shlex.quote(str(DISPATCH))} "$@"
 """
 HOOK_NAMES = ("applypatch-msg pre-applypatch post-applypatch pre-commit pre-merge-commit prepare-commit-msg "
               "commit-msg post-commit pre-rebase post-checkout post-merge pre-push pre-receive update "
@@ -353,7 +356,7 @@ def hooks_folder(uninstall):
             GIT_HOOKS.chmod(0o755)
             for p in GIT_HOOKS.iterdir():
                 if (p.is_symlink() and os.readlink(p) in (STUB_NAME, str(DISPATCH))) or \
-                        (p == stub and p.read_text() == STUB):
+                        (p == stub and p.is_file() and not p.is_symlink()):  # any version of our stub
                     p.chmod(0o755) if not p.is_symlink() else None
                     p.unlink()
             if not any(GIT_HOOKS.iterdir()):

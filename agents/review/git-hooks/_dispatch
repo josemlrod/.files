@@ -14,7 +14,8 @@ git rev-parse --git-dir >/dev/null 2>&1 || exit 0
 
 if [ "$hook" = pre-push ]; then
   input=$(cat)
-  printf '%s' "${input:+$input$'\n'}" | "$HOME/.agents/review/bin/review" pre-push "$@" || exit 1
+  # The CLI sits next to this folder; don't rely on $HOME, which a command may change.
+  printf '%s' "${input:+$input$'\n'}" | "$(cd "$(dirname "$0")/.." && pwd)/bin/review" pre-push "$@" || exit 1
 fi
 
 dir=$(env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 git config --get core.hooksPath 2>/dev/null)
