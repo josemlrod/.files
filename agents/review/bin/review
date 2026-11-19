@@ -404,11 +404,14 @@ def cmd_outcome(a):
         f.update(status="resolved", outcome=a.outcome, reason=a.reason)
         log("outcome", repo, id=fid, severity=f["severity"], file=f["file"], outcome=a.outcome,
             reason=a.reason, reviewer=f.get("reviewer", ""), **{"class": f["class"]})
-    # Rejecting, or accepting as intentional, the last blocking finding passes the last
-    # reviewed tree if its checks passed. A fixed finding doesn't: the fix is in newer
-    # code, and only a new round over that code can pass it.
+    # Resolving the last blocking finding passes the last reviewed tree if its checks
+    # passed, unless an important finding found in that same tree was marked fixed:
+    # the fix is in newer code, and only a new round over that code can pass it.
     last = st["rounds"][-1] if st["rounds"] else None
-    if a.outcome != "fixed" and last and last["checks"].get("ok") and not open_findings(st, "important"):
+    trees = {r["n"]: r["tree"] for r in st["rounds"]}
+    fixed_in_last = [f for f in st["findings"].values() if f["severity"] == "important"
+                     and f.get("outcome") == "fixed" and last and trees.get(f["round"]) == last["tree"]]
+    if last and last["checks"].get("ok") and not open_findings(st, "important") and not fixed_in_last:
         if last["verdict"] != "pass":
             log("pass", repo, round=last["n"], via="outcome")
         st["last_pass_tree"], st["failed_since_pass"] = last["tree"], 0
@@ -815,68 +818,202 @@ def cmd_stats(a):
 
 # ---------- gate ----------
 
-PUSH_RE = re.compile(r"(?:^|[\s;&|(])git(?:\s+-[cC]\s+\S+)*\s+push\b")
-PR_RE = re.compile(r"(?:^|[\s;&|(])gh\s+pr\s+create\b")
-HEREDOC_RE = re.compile(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n(.*?^\s*\2\s*$)", re.S | re.M)
-QUOTED_RE = re.compile(r"'[^']*'|\"(?:\\.|[^\"\\])*\"")
-SEGMENT_SEP_RE = re.compile(r"&&|\|\||[;&|\n()]")
+QUICK_RE = re.compile(r"push|\bpr\b")
+RAW_PUSH_RE = re.compile(r"\bgit\b.*\bpush\b|\bgh\b.*\bpr\b.*\bcreate\b", re.S)
+HEREDOC_OP_RE = re.compile(r"<<-?[ \t]*(?:(['\"])(?P<q>[^'\"\n]+)\1|(?P<esc>\\)?(?P<b>[\w.@-]+))")
+ASSIGN_RE = re.compile(r"^[A-Za-z_]\w*=")
+VAR_RE = re.compile(r"\$(?:\{(\w+)\}|(\w+))")
+KEYWORDS = {"{", "}", "!", "if", "then", "else", "elif", "fi", "do", "done", "while", "until"}
+WRAPPERS = {"env", "command", "builtin", "exec", "nohup", "time", "sudo", "nice", "xargs", "timeout",
+            "caffeinate"}
 PUSH_VALUE_OPTS = {"-o", "--push-option", "--repo", "--receive-pack", "--exec"}
 
 
-def unquoted(command):
-    """The command with heredoc bodies and the inside of quoted strings replaced by
-    spaces, so text that only mentions `git push` (commit messages, prompts, grep
-    patterns) doesn't match. Quotes are matched left to right, so an apostrophe
-    inside a double-quoted string stays inside it. The result has the same length
-    as the input, so a span found in it is the same span in the raw command."""
-    def blank(text):
-        return re.sub(r"[^\n]", " ", text)
-    command = HEREDOC_RE.sub(lambda m: m.group(0)[:m.start(3) - m.start(0)] + blank(m.group(3)), command)
-    return QUOTED_RE.sub(lambda m: m.group(0)[0] + " " * (len(m.group(0)) - 2) + m.group(0)[-1], command)
+def scan_shell(command):
+    """Split a shell command into simple commands, grouped the way bash groups them.
+
+    Returns (events, ok, risky). Each event is one of:
+      ("cmd", text)           a simple command, with comments and heredoc bodies removed
+      ("sep", op)             ; && || | |& & or a newline
+      ("open",) ("close",)    a subshell: ( ), $( ), or backticks
+    A command substitution is replaced by $X in the command that contains it, and its
+    own commands are emitted between "open" and "close". ok is False when a quote,
+    subshell, or heredoc is left open. risky is True when an unquoted heredoc body runs
+    a command substitution that mentions a push.
+    """
+    events, pending, risky = [], [], False
+    frames = [{"kind": "top", "buf": [], "dq": False}]
+
+    def flush():
+        text = "".join(frames[-1]["buf"]).strip()
+        frames[-1]["buf"] = []
+        if text:
+            events.append(("cmd", text))
+
+    def open_frame(kind):
+        frames.append({"kind": kind, "buf": [], "dq": False})
+        events.append(("open",))
+
+    def close_frame():
+        flush()
+        frames.pop()
+        events.append(("close",))
+
+    i, n = 0, len(command)
+    while i < n:
+        f, c = frames[-1], command[i]
+        buf, nxt = f["buf"], command[i + 1:i + 2]
+        if f["dq"]:  # inside "...": only \, ", $( and ` mean anything
+            if c == "\\":
+                buf.append(command[i:i + 2])
+                i += 2
+            elif c == '"':
+                f["dq"] = False
+                buf.append(c)
+                i += 1
+            elif c == "$" and nxt == "(":
+                buf.append("$X")
+                open_frame("subst")
+                i += 2
+            elif c == "`":
+                buf.append("$X")
+                open_frame("btick")
+                i += 1
+            else:
+                buf.append(c)
+                i += 1
+            continue
+        if c == "\\":
+            buf.append(" " if nxt == "\n" else command[i:i + 2])  # backslash-newline joins lines
+            i += 2
+        elif c == "'":
+            j = command.find("'", i + 1)
+            if j < 0:
+                return events, False, risky
+            buf.append(command[i:j + 1])
+            i = j + 1
+        elif c == '"':
+            f["dq"] = True
+            buf.append(c)
+            i += 1
+        elif c == "#" and (not buf or buf[-1][-1:] in (" ", "\t")):
+            j = command.find("\n", i)
+            i = n if j < 0 else j
+        elif c == "$" and nxt == "(":
+            buf.append("$X")
+            open_frame("subst")
+            i += 2
+        elif c == "`":
+            if f["kind"] == "btick":
+                close_frame()
+            else:
+                buf.append("$X")
+                open_frame("btick")
+            i += 1
+        elif c == "(":
+            flush()
+            open_frame("paren")
+            i += 1
+        elif c == ")" and f["kind"] in ("paren", "subst"):
+            close_frame()
+            i += 1
+        elif c == "<" and command.startswith("<<", i) and not command.startswith("<<<", i) \
+                and (m := HEREDOC_OP_RE.match(command, i)):
+            pending.append((m.group("q") or m.group("b"), bool(m.group("q") or m.group("esc"))))
+            buf.append(m.group(0))
+            i = m.end()
+        elif c == "&" and (nxt == ">" or "".join(buf).endswith(">")):  # &> and >& are redirections
+            buf.append(c)
+            i += 1
+        elif c in ";&|\n":
+            two = command[i:i + 2]
+            op = two if two in ("&&", "||", "|&", ";;") else c
+            flush()
+            events.append(("sep", op))
+            i += len(op)
+            if c == "\n" and pending:
+                for delim, quoted in pending:
+                    while True:
+                        k = command.find("\n", i)
+                        line = command[i:n if k < 0 else k]
+                        i = n if k < 0 else k + 1
+                        if line.strip() == delim:
+                            break
+                        if not quoted and ("$(" in line or "`" in line) and RAW_PUSH_RE.search(line):
+                            risky = True
+                        if k < 0:
+                            return events, False, risky
+                pending = []
+        else:
+            buf.append(c)
+            i += 1
+    ok = len(frames) == 1 and not frames[0]["dq"] and not pending
+    while len(frames) > 1:
+        close_frame()
+    flush()
+    return events, ok, risky
 
 
-def segments(code):
-    """(start, end) spans of the simple commands in `code`, split on ; && || | & ( ) and newlines."""
-    spans, pos = [], 0
-    for m in SEGMENT_SEP_RE.finditer(code):
-        spans.append((pos, m.start()))
-        pos = m.end()
-    spans.append((pos, len(code)))
-    return [(a, b) for a, b in spans if code[a:b].strip()]
+def expand(word, env):
+    """`word` with $VAR, ${VAR} and a leading ~ expanded, or None if a variable is unknown."""
+    missing = []
+    out = VAR_RE.sub(lambda m: env.get(m.group(1) or m.group(2)) or missing.append(1) or "", word)
+    return None if missing or "$X" in word else os.path.expanduser(out)
 
 
-def words(text):
-    try:
-        return shlex.split(text)
-    except ValueError:
-        return text.split()
-
-
-def resolve_dir(cwd, path):
-    path = os.path.join(cwd, os.path.expanduser(path or "~"))
+def resolve_dir(cwd, path, env):
+    path = expand(path, env) if path is not None else str(Path.home())
+    if path is None or path == "-":
+        return None
+    path = os.path.normpath(os.path.join(cwd, path))
     return path if os.path.isdir(path) else None
 
 
-def push_target(ws, cwd):
-    """For a `git ... push ...` command split into words: the directory it runs in
-    and the arguments after `push`, or (cwd, None) when it can't be parsed."""
-    i = next((k for k, w in enumerate(ws) if w == "git" or w.endswith("/git")), None)
-    if i is None:
-        return cwd, None
-    j = i + 1
-    while j < len(ws) and ws[j] != "push":
-        if ws[j] == "-C" and j + 1 < len(ws):
-            cwd = resolve_dir(cwd, ws[j + 1]) or cwd
+def command_words(text, env):
+    """The words of a simple command from its command name on, after dropping shell
+    keywords, variable assignments (which are recorded in env), and wrappers such as
+    env, sudo, or xargs. Returns (words, parsed)."""
+    try:
+        ws, parsed = shlex.split(text), True
+    except ValueError:
+        ws, parsed = text.split(), False
+    while ws:
+        if ws[0] in KEYWORDS:
+            ws = ws[1:]
+        elif ASSIGN_RE.match(ws[0]) or ws[0] in ("export", "local", "declare", "readonly"):
+            if ASSIGN_RE.match(ws[0]):
+                name, value = ws[0].split("=", 1)
+                env[name] = expand(value, env) or ""
+            ws = ws[1:]
+        elif os.path.basename(ws[0]) in WRAPPERS:
+            ws = ws[1:]
+            while ws and (ws[0].startswith("-") or ASSIGN_RE.match(ws[0]) or re.fullmatch(r"\d+[smhd]?", ws[0])):
+                ws = ws[1:]
+        else:
+            break
+    return ws, parsed
+
+
+def git_push(ws, cur, env):
+    """For `git [options] push ...`: (directory, arguments after push, unsure). Else None."""
+    unsure, j = False, 1
+    while j < len(ws) and ws[j].startswith("-"):
+        w = ws[j]
+        if w == "-C" and j + 1 < len(ws):
+            d = resolve_dir(cur, ws[j + 1], env)
+            unsure, cur = unsure or d is None, d or cur
             j += 2
-        elif ws[j] == "-c":
+        elif w in ("-c", "--namespace", "--config-env", "--git-dir", "--work-tree"):
+            unsure = unsure or w in ("--git-dir", "--work-tree")
             j += 2
         else:
+            unsure = unsure or w.startswith(("--git-dir=", "--work-tree="))
             j += 1
-    return cwd, (ws[j + 1:] if j < len(ws) else None)
+    return (cur, ws[j + 1:], unsure) if ws[j:j + 1] == ["push"] else None
 
 
 def pushes_no_code(args):
-    """True when a push's arguments only delete refs or only push tags."""
+    """True when a push's arguments only delete remote refs or only push tags."""
     if args is None:
         return False
     flags, positional, k = set(), [], 0
@@ -896,30 +1033,82 @@ def pushes_no_code(args):
     if flags & {"-d", "--delete"}:
         return True
     if refspecs:
-        return all(r.startswith(":") for r in refspecs)
+        # ":branch" deletes branch; a bare ":" pushes every matching branch.
+        return all(r.startswith(":") and len(r) > 1 for r in refspecs)
     return "--tags" in flags
+
+
+def push_targets(command, cwd):
+    """Directories whose repos a command pushes or opens a PR from.
+
+    Returns (targets, unsure). unsure is True when the command's directory could not
+    be worked out for certain, for example after a conditional or unresolvable cd."""
+    events, ok, risky = scan_shell(command)
+    env = dict(os.environ)
+    targets, unsure, cur, saved, prev_cd = [], not ok or risky, cwd, [], False
+    for k, e in enumerate(events):
+        if e[0] == "open":
+            saved.append(cur)
+            prev_cd = False
+            continue
+        if e[0] == "close":
+            cur = saved.pop() if saved else cur
+            continue
+        if e[0] == "sep":
+            continue
+        prev_op = events[k - 1][1] if k and events[k - 1][0] == "sep" else None
+        next_op = events[k + 1][1] if k + 1 < len(events) and events[k + 1][0] == "sep" else None
+        ws, parsed = command_words(e[1], env)
+        name = os.path.basename(ws[0]) if ws else ""
+        if name in ("cd", "pushd", "popd"):
+            arg = next((w for w in ws[1:] if not w.startswith("-") or w == "-"), None)
+            d = resolve_dir(cur, arg, env) if name != "popd" else None
+            in_pipe = "|" in (prev_op, next_op) or "|&" in (prev_op, next_op)
+            conditional = prev_op == "||" or (prev_op == "&&" and not prev_cd)
+            if d is None or in_pipe or conditional:
+                unsure = True
+            if d and not in_pipe:
+                cur = d
+            prev_cd = True
+            continue
+        prev_cd = False
+        if name == "git":
+            hit = git_push(ws, cur, env)
+            if hit and not pushes_no_code(hit[1]):
+                targets.append(hit[0])
+                unsure = unsure or hit[2] or not parsed
+        elif name == "gh" and [w for w in ws[1:] if not w.startswith("-")][:2] == ["pr", "create"]:
+            targets.append(cur)
+            unsure = unsure or not parsed
+    if risky or (not ok and RAW_PUSH_RE.search(command)):
+        # A heredoc body runs a push, or an unclosed quote may hide one: check where the shell started.
+        targets.append(cwd)
+    if unsure and targets:
+        targets.append(cwd)
+    return list(dict.fromkeys(targets)), unsure
+
+
+def in_repo(path):
+    try:
+        Repo(path)
+        return True
+    except (GitError, FileNotFoundError, NotADirectoryError):
+        return False
 
 
 def gate(command, cwd):
     """Return None to allow, or a message explaining the block."""
-    code = unquoted(command)
-    if not (PUSH_RE.search(code) or PR_RE.search(code)) or (DATA / "GATE_OFF").exists():
+    if not QUICK_RE.search(command) or (DATA / "GATE_OFF").exists():
         return None
-    targets, cur = [], cwd
-    for a, b in segments(code):
-        seg_code, ws = code[a:b], words(command[a:b])
-        if ws[:1] == ["cd"]:
-            cur = resolve_dir(cur, ws[1] if len(ws) > 1 else None) or cur
-        elif PR_RE.search(seg_code):
-            targets.append(cur)
-        elif PUSH_RE.search(seg_code):
-            where, args = push_target(ws, cur)
-            if not pushes_no_code(args):
-                targets.append(where)
-    for target in dict.fromkeys(targets):
+    targets, unsure = push_targets(command, cwd)
+    for target in targets:
         msg = gate_repo(target)
         if msg:
             return msg
+    if targets and unsure and not any(in_repo(t) for t in targets):
+        return ("Pre-PR review gate blocked this command: it could not tell which repository the "
+                "push or PR is for. Run it from inside the repo, or name the repo with a literal "
+                "path, such as `git -C /abs/path/to/repo push`.")
     return None
 
 

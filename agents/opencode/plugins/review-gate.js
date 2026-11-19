@@ -14,7 +14,7 @@ const dbg = (...a) => DEBUG && fs.appendFileSync(DEBUG, JSON.stringify(a) + "\n"
 
 // Returns the block message, or undefined to allow.
 function gate(command, cwd) {
-  if (!/\bpush\b|\bpr\s+create\b/.test(command ?? "")) return;
+  if (!/push|\bpr\b/.test(command ?? "")) return;
   const r = spawnSync(CLI, ["--cwd", cwd, "gate", "--command", command], {
     encoding: "utf8",
     timeout: 30000,
@@ -44,7 +44,7 @@ export default {
       dbg("before", e.tool, e.input);
       if (!SHELL_TOOLS.has(e.tool)) return;
       const command = e.input?.command;
-      if (!/\bpush\b|\bpr\s+create\b/.test(command ?? "")) return;
+      if (!/push|\bpr\b/.test(command ?? "")) return;
       const msg = gate(command, await sessionDir(ctx, e, e.input?.workdir));
       if (msg) throw new Error(msg);
     });
