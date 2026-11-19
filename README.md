@@ -9,6 +9,7 @@ Each tool gets its own folder. The live config path on my machine is a symlink i
 | Tool | File in repo | Linked from |
 | --- | --- | --- |
 | Rex | `rex/init.lua` | `~/.config/rex/init.lua` |
+| Claude Code, Cursor, OpenCode | `agents/` | `~/.agents/`, `~/.claude/`, `~/.cursor/`, `~/.config/opencode/`. See [agents/README.md](agents/README.md). |
 
 ## Setting up a new machine
 
@@ -17,3 +18,5 @@ git clone https://github.com/josemlrod/.files.git ~/.files
 mkdir -p ~/.config/rex
 ln -sf ~/.files/rex/init.lua ~/.config/rex/init.lua
 ```
+
+For the agent setup, run `~/.files/agents/install.py` after cloning. It links its own files and merges its hook entries into the agents' configs.
