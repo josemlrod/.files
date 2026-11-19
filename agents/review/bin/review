@@ -131,8 +131,12 @@ class Repo:
         if branch in ("", "HEAD"):
             branch = "detached-" + (git("rev-parse", "--verify", "--quiet", "--short", "HEAD",
                                        cwd=self.root, check=False) or "nohead")
-        self.branch = branch
         self.config_dir = DATA / self.name
+        self.use_branch(branch)
+
+    def use_branch(self, branch):
+        """Point this Repo at another branch's review state."""
+        self.branch = branch
         self.state_path = STATE_DIR / self.name / (branch.replace("/", "__") + ".json")
 
     def config(self, filename):
@@ -401,16 +405,15 @@ def cmd_outcome(a):
         f = st["findings"].get(fid)
         if not f:
             sys.exit(f"No finding {fid} on {repo.name}/{repo.branch}.")
-        f.update(status="resolved", outcome=a.outcome, reason=a.reason)
+        f.update(status="resolved", outcome=a.outcome, reason=a.reason, resolved_after_round=len(st["rounds"]))
         log("outcome", repo, id=fid, severity=f["severity"], file=f["file"], outcome=a.outcome,
             reason=a.reason, reviewer=f.get("reviewer", ""), **{"class": f["class"]})
     # Resolving the last blocking finding passes the last reviewed tree if its checks
-    # passed, unless an important finding found in that same tree was marked fixed:
-    # the fix is in newer code, and only a new round over that code can pass it.
+    # passed, unless an important finding was marked fixed after that round: the fix
+    # is in newer code, and only a new round over that code can pass it.
     last = st["rounds"][-1] if st["rounds"] else None
-    trees = {r["n"]: r["tree"] for r in st["rounds"]}
     fixed_in_last = [f for f in st["findings"].values() if f["severity"] == "important"
-                     and f.get("outcome") == "fixed" and last and trees.get(f["round"]) == last["tree"]]
+                     and f.get("outcome") == "fixed" and last and f.get("resolved_after_round") == last["n"]]
     if last and last["checks"].get("ok") and not open_findings(st, "important") and not fixed_in_last:
         if last["verdict"] != "pass":
             log("pass", repo, round=last["n"], via="outcome")
@@ -818,312 +821,44 @@ def cmd_stats(a):
 
 # ---------- gate ----------
 
-QUICK_RE = re.compile(r"push|\bpr\b")
-RAW_PUSH_RE = re.compile(r"\bgit\b.*\bpush\b|\bgh\b.*\bpr\b.*\bcreate\b", re.S)
-HEREDOC_OP_RE = re.compile(r"<<-?[ \t]*(?:(['\"])(?P<q>[^'\"\n]+)\1|(?P<esc>\\)?(?P<b>[\w.@-]+))")
-ASSIGN_RE = re.compile(r"^[A-Za-z_]\w*=")
-VAR_RE = re.compile(r"\$(?:\{(\w+)\}|(\w+))")
-KEYWORDS = {"{", "}", "!", "if", "then", "else", "elif", "fi", "do", "done", "while", "until"}
-WRAPPERS = {"env", "command", "builtin", "exec", "nohup", "time", "sudo", "nice", "xargs", "timeout",
-            "caffeinate"}
-PUSH_VALUE_OPTS = {"-o", "--push-option", "--repo", "--receive-pack", "--exec"}
+# The review check runs inside git: agents' shells point core.hooksPath at
+# ../git-hooks through GIT_CONFIG_* environment variables, so git calls
+# `review pre-push` with the exact refs it is about to push, however the push
+# command was written. The pre-tool check below only stops commands that would
+# switch that hook off.
 
-
-def scan_shell(command):
-    """Split a shell command into simple commands, grouped the way bash groups them.
-
-    Returns (events, ok, risky). Each event is one of:
-      ("cmd", text)           a simple command, with comments and heredoc bodies removed
-      ("sep", op)             ; && || | |& & or a newline
-      ("open",) ("close",)    a subshell: ( ), $( ), or backticks
-    A command substitution is replaced by $X in the command that contains it, and its
-    own commands are emitted between "open" and "close". ok is False when a quote,
-    subshell, or heredoc is left open. risky is True when an unquoted heredoc body runs
-    a command substitution that mentions a push.
-    """
-    events, pending, risky = [], [], False
-    frames = [{"kind": "top", "buf": [], "dq": False}]
-
-    def flush():
-        text = "".join(frames[-1]["buf"]).strip()
-        frames[-1]["buf"] = []
-        if text:
-            events.append(("cmd", text))
-
-    def open_frame(kind):
-        frames.append({"kind": kind, "buf": [], "dq": False})
-        events.append(("open",))
-
-    def close_frame():
-        flush()
-        frames.pop()
-        events.append(("close",))
-
-    i, n = 0, len(command)
-    while i < n:
-        f, c = frames[-1], command[i]
-        buf, nxt = f["buf"], command[i + 1:i + 2]
-        if f["dq"]:  # inside "...": only \, ", $( and ` mean anything
-            if c == "\\":
-                buf.append(command[i:i + 2])
-                i += 2
-            elif c == '"':
-                f["dq"] = False
-                buf.append(c)
-                i += 1
-            elif c == "$" and nxt == "(":
-                buf.append("$X")
-                open_frame("subst")
-                i += 2
-            elif c == "`":
-                buf.append("$X")
-                open_frame("btick")
-                i += 1
-            else:
-                buf.append(c)
-                i += 1
-            continue
-        if c == "\\":
-            buf.append(" " if nxt == "\n" else command[i:i + 2])  # backslash-newline joins lines
-            i += 2
-        elif c == "'":
-            j = command.find("'", i + 1)
-            if j < 0:
-                return events, False, risky
-            buf.append(command[i:j + 1])
-            i = j + 1
-        elif c == '"':
-            f["dq"] = True
-            buf.append(c)
-            i += 1
-        elif c == "#" and (not buf or buf[-1][-1:] in (" ", "\t")):
-            j = command.find("\n", i)
-            i = n if j < 0 else j
-        elif c == "$" and nxt == "(":
-            buf.append("$X")
-            open_frame("subst")
-            i += 2
-        elif c == "`":
-            if f["kind"] == "btick":
-                close_frame()
-            else:
-                buf.append("$X")
-                open_frame("btick")
-            i += 1
-        elif c == "(":
-            flush()
-            open_frame("paren")
-            i += 1
-        elif c == ")" and f["kind"] in ("paren", "subst"):
-            close_frame()
-            i += 1
-        elif c == "<" and command.startswith("<<", i) and not command.startswith("<<<", i) \
-                and (m := HEREDOC_OP_RE.match(command, i)):
-            pending.append((m.group("q") or m.group("b"), bool(m.group("q") or m.group("esc"))))
-            buf.append(m.group(0))
-            i = m.end()
-        elif c == "&" and (nxt == ">" or "".join(buf).endswith(">")):  # &> and >& are redirections
-            buf.append(c)
-            i += 1
-        elif c in ";&|\n":
-            two = command[i:i + 2]
-            op = two if two in ("&&", "||", "|&", ";;") else c
-            flush()
-            events.append(("sep", op))
-            i += len(op)
-            if c == "\n" and pending:
-                for delim, quoted in pending:
-                    while True:
-                        k = command.find("\n", i)
-                        line = command[i:n if k < 0 else k]
-                        i = n if k < 0 else k + 1
-                        if line.strip() == delim:
-                            break
-                        if not quoted and ("$(" in line or "`" in line) and RAW_PUSH_RE.search(line):
-                            risky = True
-                        if k < 0:
-                            return events, False, risky
-                pending = []
-        else:
-            buf.append(c)
-            i += 1
-    ok = len(frames) == 1 and not frames[0]["dq"] and not pending
-    while len(frames) > 1:
-        close_frame()
-    flush()
-    return events, ok, risky
-
-
-def expand(word, env):
-    """`word` with $VAR, ${VAR} and a leading ~ expanded, or None if a variable is unknown."""
-    missing = []
-    out = VAR_RE.sub(lambda m: env.get(m.group(1) or m.group(2)) or missing.append(1) or "", word)
-    return None if missing or "$X" in word else os.path.expanduser(out)
-
-
-def resolve_dir(cwd, path, env):
-    path = expand(path, env) if path is not None else str(Path.home())
-    if path is None or path == "-":
-        return None
-    path = os.path.normpath(os.path.join(cwd, path))
-    return path if os.path.isdir(path) else None
-
-
-def command_words(text, env):
-    """The words of a simple command from its command name on, after dropping shell
-    keywords, variable assignments (which are recorded in env), and wrappers such as
-    env, sudo, or xargs. Returns (words, parsed)."""
-    try:
-        ws, parsed = shlex.split(text), True
-    except ValueError:
-        ws, parsed = text.split(), False
-    while ws:
-        if ws[0] in KEYWORDS:
-            ws = ws[1:]
-        elif ASSIGN_RE.match(ws[0]) or ws[0] in ("export", "local", "declare", "readonly"):
-            if ASSIGN_RE.match(ws[0]):
-                name, value = ws[0].split("=", 1)
-                env[name] = expand(value, env) or ""
-            ws = ws[1:]
-        elif os.path.basename(ws[0]) in WRAPPERS:
-            ws = ws[1:]
-            while ws and (ws[0].startswith("-") or ASSIGN_RE.match(ws[0]) or re.fullmatch(r"\d+[smhd]?", ws[0])):
-                ws = ws[1:]
-        else:
-            break
-    return ws, parsed
-
-
-def git_push(ws, cur, env):
-    """For `git [options] push ...`: (directory, arguments after push, unsure). Else None."""
-    unsure, j = False, 1
-    while j < len(ws) and ws[j].startswith("-"):
-        w = ws[j]
-        if w == "-C" and j + 1 < len(ws):
-            d = resolve_dir(cur, ws[j + 1], env)
-            unsure, cur = unsure or d is None, d or cur
-            j += 2
-        elif w in ("-c", "--namespace", "--config-env", "--git-dir", "--work-tree"):
-            unsure = unsure or w in ("--git-dir", "--work-tree")
-            j += 2
-        else:
-            unsure = unsure or w.startswith(("--git-dir=", "--work-tree="))
-            j += 1
-    return (cur, ws[j + 1:], unsure) if ws[j:j + 1] == ["push"] else None
-
-
-def pushes_no_code(args):
-    """True when a push's arguments only delete remote refs or only push tags."""
-    if args is None:
-        return False
-    flags, positional, k = set(), [], 0
-    while k < len(args):
-        a = args[k]
-        if a in PUSH_VALUE_OPTS:
-            k += 2
-            continue
-        if a.startswith("-") and a != "-":
-            flags.add(a.split("=", 1)[0])
-        else:
-            positional.append(a)
-        k += 1
-    refspecs = positional[1:]  # the first positional argument is the remote
-    if flags & {"--all", "--mirror", "--branches"}:
-        return False
-    if flags & {"-d", "--delete"}:
-        return True
-    if refspecs:
-        # ":branch" deletes branch; a bare ":" pushes every matching branch.
-        return all(r.startswith(":") and len(r) > 1 for r in refspecs)
-    return "--tags" in flags
-
-
-def push_targets(command, cwd):
-    """Directories whose repos a command pushes or opens a PR from.
-
-    Returns (targets, unsure). unsure is True when the command's directory could not
-    be worked out for certain, for example after a conditional or unresolvable cd."""
-    events, ok, risky = scan_shell(command)
-    env = dict(os.environ)
-    targets, unsure, cur, saved, prev_cd = [], not ok or risky, cwd, [], False
-    for k, e in enumerate(events):
-        if e[0] == "open":
-            saved.append(cur)
-            prev_cd = False
-            continue
-        if e[0] == "close":
-            cur = saved.pop() if saved else cur
-            continue
-        if e[0] == "sep":
-            continue
-        prev_op = events[k - 1][1] if k and events[k - 1][0] == "sep" else None
-        next_op = events[k + 1][1] if k + 1 < len(events) and events[k + 1][0] == "sep" else None
-        ws, parsed = command_words(e[1], env)
-        name = os.path.basename(ws[0]) if ws else ""
-        if name in ("cd", "pushd", "popd"):
-            arg = next((w for w in ws[1:] if not w.startswith("-") or w == "-"), None)
-            d = resolve_dir(cur, arg, env) if name != "popd" else None
-            in_pipe = "|" in (prev_op, next_op) or "|&" in (prev_op, next_op)
-            conditional = prev_op == "||" or (prev_op == "&&" and not prev_cd)
-            if d is None or in_pipe or conditional:
-                unsure = True
-            if d and not in_pipe:
-                cur = d
-            prev_cd = True
-            continue
-        prev_cd = False
-        if name == "git":
-            hit = git_push(ws, cur, env)
-            if hit and not pushes_no_code(hit[1]):
-                targets.append(hit[0])
-                unsure = unsure or hit[2] or not parsed
-        elif name == "gh" and [w for w in ws[1:] if not w.startswith("-")][:2] == ["pr", "create"]:
-            targets.append(cur)
-            unsure = unsure or not parsed
-    if risky or (not ok and RAW_PUSH_RE.search(command)):
-        # A heredoc body runs a push, or an unclosed quote may hide one: check where the shell started.
-        targets.append(cwd)
-    if unsure and targets:
-        targets.append(cwd)
-    return list(dict.fromkeys(targets)), unsure
-
-
-def in_repo(path):
-    try:
-        Repo(path)
-        return True
-    except (GitError, FileNotFoundError, NotADirectoryError):
-        return False
+HOOK_OFF_RE = re.compile(r"--no-verify|hooksPath|GIT_CONFIG_|\benv\s+(?:-\w*[iu]|--ignore-environment|--unset)")
+SETS_GIT_CONFIG_RE = re.compile(r"^\s*(?:export\s+|unset\s+)?GIT_CONFIG_\w*", re.M)
+GIT_PUSH_RE = re.compile(r"\bgit\b.*\bpush\b", re.S)
+ZERO_SHA = re.compile(r"^0+$")
 
 
 def gate(command, cwd):
-    """Return None to allow, or a message explaining the block."""
-    if not QUICK_RE.search(command) or (DATA / "GATE_OFF").exists():
+    """Return a message if a shell command would push while skipping git's pre-push
+    hook, or None. Everything else is left to the hook. It looks for a push and a
+    hook-skipping option on the same line, or a line that sets GIT_CONFIG_* in a
+    command that also pushes, so a file that only mentions them isn't blocked."""
+    if (DATA / "GATE_OFF").exists() or "push" not in command:
         return None
-    targets, unsure = push_targets(command, cwd)
-    for target in targets:
-        msg = gate_repo(target)
-        if msg:
-            return msg
-    if targets and unsure and not any(in_repo(t) for t in targets):
-        return ("Pre-PR review gate blocked this command: it could not tell which repository the "
-                "push or PR is for. Run it from inside the repo, or name the repo with a literal "
-                "path, such as `git -C /abs/path/to/repo push`.")
-    return None
+    same_line = any("push" in line and HOOK_OFF_RE.search(line) for line in command.splitlines())
+    if not same_line and not (SETS_GIT_CONFIG_RE.search(command) and GIT_PUSH_RE.search(command)):
+        return None
+    return ("Pre-PR review gate blocked this command: it would skip git's pre-push hook, which "
+            "runs the review check (--no-verify, a core.hooksPath override, or changed "
+            "GIT_CONFIG_* variables). Push without those. If the push is blocked, run the "
+            f"pre-pr skill ({SKILL}).")
 
 
-def gate_repo(cwd):
-    """Return None if the repo at `cwd` may be pushed, or a message explaining the block."""
-    try:
-        repo = Repo(cwd)
-    except (GitError, FileNotFoundError, NotADirectoryError):
-        return None
-    head = repo.head_tree()
-    base = git("merge-base", "HEAD", f"origin/{repo.default_branch()}", cwd=repo.root, check=False)
-    if not head or (base and git("rev-parse", "--verify", "--quiet", f"{base}^{{tree}}", cwd=repo.root, check=False) == head):
-        return None
+def check_push(repo, branch, sha):
+    """Return None if `sha` on `branch` may be pushed, or a message explaining the block."""
+    tree = git("rev-parse", "--verify", "--quiet", f"{sha}^{{tree}}", cwd=repo.root, check=False)
+    base = git("merge-base", sha, f"origin/{repo.default_branch()}", cwd=repo.root, check=False)
+    if not tree or (base and git("rev-parse", "--verify", "--quiet", f"{base}^{{tree}}",
+                                 cwd=repo.root, check=False) == tree):
+        return None  # nothing new compared with the default branch
+    repo.use_branch(branch)
     st = load_state(repo)
-    if head in (st.get("last_pass_tree"), st.get("skip_tree")):
+    if tree in (st.get("last_pass_tree"), st.get("skip_tree")):
         return None
 
     blocking = open_findings(st, "important")
@@ -1137,12 +872,34 @@ def gate_repo(cwd):
     if st["failed_since_pass"] >= MAX_FAILED_ROUNDS:
         why += (f" {st['failed_since_pass']} review rounds have failed in a row: stop and discuss the "
                 "approach with the user before another round.")
-    return (f"Pre-PR review gate blocked this command for {repo.name}/{repo.branch}: {why}\n"
+    return (f"Pre-PR review gate blocked this push for {repo.name}/{branch}: {why}\n"
             f"Run the pre-pr skill ({SKILL}), fix or resolve its findings, then retry. "
             "Only if the user explicitly told you to skip review for this push, run "
             f"`{CLI} skip --reason \"<the user's words>\"` and retry.")
 
 
+def cmd_pre_push(a):
+    """Called by git's pre-push hook. Reads `<local ref> <local sha> <remote ref> <remote sha>`
+    lines on stdin and exits 1 if any pushed branch holds code that hasn't passed review."""
+    lines = sys.stdin.read().splitlines()
+    if (DATA / "GATE_OFF").exists():
+        return
+    repo = Repo(os.getcwd())
+    problems = []
+    for line in lines:
+        parts = line.split()
+        if len(parts) != 4:
+            continue
+        local_ref, local_sha, remote_ref, remote_sha = parts
+        if ZERO_SHA.match(local_sha) or remote_ref.startswith("refs/tags/") or local_sha == remote_sha:
+            continue  # a delete, a tag, or nothing new
+        branch = local_ref[len("refs/heads/"):] if local_ref.startswith("refs/heads/") else repo.branch
+        msg = check_push(repo, branch, local_sha)
+        if msg:
+            problems.append(msg)
+    if problems:
+        print("\n".join(problems), file=sys.stderr)
+        sys.exit(1)
 
 
 def cmd_gate(a):
@@ -1267,9 +1024,14 @@ def main():
     s = sub.add_parser("status", help="show review state for the current branch")
     s.set_defaults(fn=cmd_status)
 
-    s = sub.add_parser("gate", help="exit 2 with a message if COMMAND would push unreviewed code")
+    s = sub.add_parser("gate", help="exit 2 with a message if COMMAND would skip git's pre-push hook")
     s.add_argument("--command", required=True)
     s.set_defaults(fn=cmd_gate)
+
+    s = sub.add_parser("pre-push", help="git pre-push hook: exit 1 if a pushed branch hasn't passed review")
+    s.add_argument("remote", nargs="?")
+    s.add_argument("url", nargs="?")
+    s.set_defaults(fn=cmd_pre_push)
 
     s = sub.add_parser("format", help="run the repo's formatter from verify.md on files")
     s.add_argument("files", nargs="+")

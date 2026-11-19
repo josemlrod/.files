@@ -6,7 +6,7 @@ Config for the coding agents I use (Claude Code, Cursor, OpenCode): a pre-PR rev
 
 | Folder | What it is | Linked to |
 | --- | --- | --- |
-| `review/` | The review engine: the `review` CLI, reviewer prompts, always-on rules, templates. See `review/README.md`. | `~/.agents/review` |
+| `review/` | The review engine: the `review` CLI, reviewer prompts, always-on rules, templates, and `git-hooks/`, which runs the review check on push. See `review/README.md`. | `~/.agents/review` |
 | `skills/pre-pr` | Runs a review round before a push: checks, parallel reviewers, a verifier | `~/.agents/skills/pre-pr` |
 | `skills/review-retro` | Measures the reviewers against what happened to PRs, then tunes this machine's local files | `~/.agents/skills/review-retro` |
 | `skills/unslop` | Writing rules applied to all prose an agent writes | `~/.agents/skills/unslop` |
@@ -27,7 +27,7 @@ git clone https://github.com/josemlrod/.files.git ~/.files
 
 It sets up whichever of the three agents are installed (or pass `--agents claude,cursor`). Running it again changes nothing. It needs `python3` 3.9+ and `git`, plus `gh` for the PR harvest.
 
-The installer links the files above. In config files that other tools share, it adds only its own entries: hooks in `~/.claude/settings.json` and `~/.cursor/hooks.json`, two `@` imports in `~/.claude/CLAUDE.md`, and `instructions` plus `permission.skill["show-me"] = "ask"` in `~/.config/opencode/opencode.jsonc`. Anything it replaces or edits is copied to `~/.agents-install-backup/<timestamp>/` first. If `opencode.jsonc` has comments, it prints the lines to add by hand instead of rewriting the file. `--uninstall` removes what it added. With `--agents`, it keeps the shared `~/.agents` links while another installed agent still uses them.
+The installer links the files above. In config files that other tools share, it adds only its own entries: hooks and three `GIT_CONFIG_*` `env` entries in `~/.claude/settings.json`, hooks in `~/.cursor/hooks.json`, a marked block in `~/.zshenv` that sets the same variables in Cursor and OpenCode agent shells, two `@` imports in `~/.claude/CLAUDE.md`, and `instructions` plus `permission.skill["show-me"] = "ask"` in `~/.config/opencode/opencode.jsonc`. Anything it replaces or edits is copied to `~/.agents-install-backup/<timestamp>/` first. If `opencode.jsonc` has comments, it prints the lines to add by hand instead of rewriting the file. `--uninstall` removes what it added. With `--agents`, it keeps the shared `~/.agents` links while another installed agent still uses them.
 
 After an install that changes OpenCode, run `opencode service restart`.
 

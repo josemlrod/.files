@@ -7,7 +7,7 @@
     ./install.py --agents claude,cursor
 
 Files are symlinked, so editing them edits this repo. Config files shared with
-other tools (settings.json, hooks.json, opencode.jsonc, CLAUDE.md) are merged:
+other tools (settings.json, hooks.json, opencode.jsonc, CLAUDE.md, ~/.zshenv) are merged:
 only this setup's entries are added or removed, and the rest is left alone.
 Anything replaced is first copied to ~/.agents-install-backup/<timestamp>/.
 Review data and per-machine rules live in ~/knowledge/review and are never
@@ -27,6 +27,22 @@ SKILLS = ["pre-pr", "review-retro", "unslop", "show-me"]
 STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 BACKUP = HOME / ".agents-install-backup" / STAMP
 LOCAL_RULES = HOME / "knowledge" / "review" / "local" / "rules.md"
+# Agents' shells get these variables, which point git's hooks at review/git-hooks.
+# Git then runs the review check on every push, however the command is written,
+# and the dispatcher there still runs each repo's own hooks.
+GIT_HOOKS = HOME / ".agents" / "review" / "git-hooks"
+GIT_ENV = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.hooksPath", "GIT_CONFIG_VALUE_0": str(GIT_HOOKS)}
+ZSHENV = HOME / ".zshenv"
+ZSHENV_START = "# >>> agent review gate (managed by ~/.files/agents/install.py) >>>"
+ZSHENV_END = "# <<< agent review gate <<<"
+ZSHENV_BLOCK = f"""{ZSHENV_START}
+# Cursor and OpenCode agent shells set CURSOR_AGENT or OPENCODE_TERMINAL. In those
+# shells, point git's hooks at the review gate. Your own terminal is unaffected.
+if [ -n "${{CURSOR_AGENT:-}}${{OPENCODE_TERMINAL:-}}" ]; then
+  export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0="$HOME/.agents/review/git-hooks"
+fi
+{ZSHENV_END}
+"""
 LOCAL_RULES_HEADER = """# Code review workflow: rules for this machine
 
 Loaded after `~/.agents/review/RULES.md` in every agent session. Rules here are
@@ -158,6 +174,18 @@ def merge_claude_settings(uninstall):
         say("skip", f"{rel(path)} is not valid JSON; add the hooks by hand (see agents/README.md)")
         return
     before = json.loads(json.dumps(data))
+    env = data.setdefault("env", {})
+    if uninstall:
+        for k, v in GIT_ENV.items():
+            if env.get(k) == v:
+                del env[k]
+    elif any(k in env and env[k] != v for k, v in GIT_ENV.items()):
+        say("skip", f"{rel(path)} already sets GIT_CONFIG_* in env; point core.hooksPath at "
+            f"{rel(GIT_HOOKS)} by hand so git runs the review check")
+    else:
+        env.update(GIT_ENV)
+    if not env:
+        del data["env"]
     hooks = data.setdefault("hooks", {})
     for event, (group_keys, hook) in claude_hooks().items():
         groups = hooks.setdefault(event, [])
@@ -291,6 +319,29 @@ def merge_claude_md(uninstall):
 
 # ---------------------------------------------------------------- main
 
+def merge_zshenv(uninstall):
+    """Add or remove the managed block in ~/.zshenv, which zsh reads for every shell,
+    including the non-interactive ones Cursor and OpenCode run commands in."""
+    text = ZSHENV.read_text() if ZSHENV.exists() else ""
+    start, end = text.find(ZSHENV_START), text.find(ZSHENV_END)
+    current = text[start:end + len(ZSHENV_END) + 1] if start >= 0 and end > start else None
+    if uninstall:
+        if current is None:
+            return
+        out = text.replace(current, "")
+    elif current == ZSHENV_BLOCK:
+        return
+    elif current is not None:
+        out = text.replace(current, ZSHENV_BLOCK)
+    else:
+        out = text + ("\n" if text and not text.endswith("\n") else "") + ZSHENV_BLOCK
+    if ZSHENV.exists():
+        backup(ZSHENV)
+    say("update", rel(ZSHENV))
+    if not DRY:
+        ZSHENV.write_text(out)
+
+
 def detect_agents():
     found = []
     if (HOME / ".claude").is_dir() or shutil.which("claude"):
@@ -337,6 +388,9 @@ def main():
         merge_cursor_hooks(a.uninstall)
     if "opencode" in agents:
         merge_opencode(a.uninstall)
+    # One ~/.zshenv block covers Cursor and OpenCode; keep it while either is still installed.
+    if {"cursor", "opencode"} & set(agents) and not (a.uninstall and {"cursor", "opencode"} & set(others)):
+        merge_zshenv(a.uninstall)
 
     if not a.uninstall and not LOCAL_RULES.exists():
         say("create", rel(LOCAL_RULES))

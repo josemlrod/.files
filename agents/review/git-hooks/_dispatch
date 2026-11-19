@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Every git hook name in this folder links here. Agents' shells point git's
+# core.hooksPath at this folder (through GIT_CONFIG_* environment variables), so
+# git runs this for every hook while an agent works. On pre-push it first runs the
+# review check. Then it runs the repo's own hook, from the hooks folder git would
+# use without the override (husky's .husky/_, .git/hooks, or a global hooksPath).
+hook=$(basename "$0")
+here=$(cd "$(dirname "$0")" && pwd -P)
+
+if [ "$hook" = pre-push ]; then
+  input=$(cat)
+  printf '%s' "${input:+$input$'\n'}" | "$HOME/.agents/review/bin/review" pre-push "$@" || exit 1
+fi
+
+dir=$(env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 git config --get core.hooksPath)
+case "$dir" in
+  "") dir="$(git rev-parse --git-common-dir)/hooks" ;;
+  "~"/*) dir="$HOME/${dir#\~/}" ;;
+  /*) ;;
+  *) dir="$(git rev-parse --show-toplevel 2>/dev/null || pwd)/$dir" ;;
+esac
+target="$dir/$hook"
+# Don't call ourselves if the repo's own setting also points here.
+[ -d "$dir" ] && [ "$(cd "$dir" && pwd -P)" = "$here" ] && exit 0
+[ -x "$target" ] || exit 0
+
+if [ "$hook" = pre-push ]; then
+  printf '%s' "${input:+$input$'\n'}" | "$target" "$@"
+  exit $?
+fi
+exec "$target" "$@"

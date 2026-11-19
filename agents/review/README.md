@@ -17,7 +17,7 @@ The engine (this folder and the `pre-pr` and `review-retro` skills) lives in the
    - A verifier tries to disprove each finding and keeps only the ones it confirms.
    - Findings in code the branch didn't change are labeled pre-existing and never block.
    - It records the round and drafts the PR's Testing, Risk, and How to revert sections.
-4. A hook blocks `git push` and `gh pr create` until a round passes for the exact tree being pushed. A round passes when the checks pass and no Important finding is open. A new commit needs a new round. Rounds after the first only review what changed. After 3 failed rounds in a row the agent stops and asks you to rethink the approach.
+4. Git's pre-push hook blocks a push until a round passes for the exact tree being pushed. Agents' shells point git's `core.hooksPath` at `git-hooks/` through `GIT_CONFIG_*` environment variables, so git runs the check for every push, however the command is written (`gh pr create` pushes through git too). The dispatcher there then runs the repo's own hooks, such as husky's. Pushes of tags, deletes, and branches with nothing new compared with the default branch are not checked. A pre-tool hook only stops commands that would skip git's hook: `--no-verify`, a `core.hooksPath` override, or changed `GIT_CONFIG_*` variables. A round passes when the checks pass and no Important finding is open. A new commit needs a new round. Rounds after the first only review what changed. After 3 failed rounds in a row the agent stops and asks you to rethink the approach.
 5. Once a day, starting from the first `pre-pr` round, `review harvest` runs in the background. It records what happened on GitHub to every reviewed branch's PR: teammates' comments, approvals, wait times, CI failures, and reverts. These are read-only `gh` calls. Nits still open at merge are recorded as `open-at-merge`, and a revert of a reviewed PR becomes an eval case.
 6. After 10 rounds, `pre-pr` says a retro is due. After the first retro, it also waits until 14 days have passed since the last one. The `review-retro` skill measures noise and misses from all of this data, writes a report, proposes changes, and applies the ones you approve. It writes only to `~/knowledge/review/`: per-repo `REVIEW.md` and `verify.md`, or the `local/` overlay. It never edits the engine. When a local change has held up for two retros and isn't specific to a repo or company, the report lists it as a candidate to copy into `.files` by hand.
 
@@ -55,15 +55,17 @@ This machine only, in `~/knowledge/review/`:
 
 ## How each agent is wired
 
-| | Rules | Gate | Formatter |
-|---|---|---|---|
-| Claude Code | `@~/.agents/review/RULES.md` and `@~/knowledge/review/local/rules.md` in `~/.claude/CLAUDE.md` | `PreToolUse` on `Bash` in `~/.claude/settings.json` | `PostToolUse` on `Edit\|Write\|MultiEdit` |
-| Cursor | `sessionStart` hook `~/.cursor/hooks/review-rules.sh` (reads both rule files) | `beforeShellExecution` in `~/.cursor/hooks.json` | `afterFileEdit` |
-| OpenCode | `instructions` in `~/.config/opencode/opencode.jsonc` | `~/.config/opencode/plugins/review-gate.js` (`tool.hook("execute.before")`) | same plugin (`execute.after`) |
+| | Rules | Git hooks folder | Hook-skip check | Formatter |
+|---|---|---|---|---|
+| Claude Code | `@~/.agents/review/RULES.md` and `@~/knowledge/review/local/rules.md` in `~/.claude/CLAUDE.md` | `env` in `~/.claude/settings.json` | `PreToolUse` on `Bash` | `PostToolUse` on `Edit\|Write\|MultiEdit` |
+| Cursor | `sessionStart` hook `~/.cursor/hooks/review-rules.sh` (reads both rule files) | `~/.zshenv` block, when `CURSOR_AGENT` is set | `beforeShellExecution` in `~/.cursor/hooks.json` | `afterFileEdit` |
+| OpenCode | `instructions` in `~/.config/opencode/opencode.jsonc` | `~/.zshenv` block, when `OPENCODE_TERMINAL` is set | `~/.config/opencode/plugins/review-gate.js` (`execute.before`) | same plugin (`execute.after`) |
+
+Cursor and OpenCode get the git variables only when they run commands with zsh, which reads `~/.zshenv` for every shell.
 
 `agents/install.py` in `.files` sets all of this up and can be run again safely.
 
-The gate only affects agents. Your own terminal, the repos' git hooks, and CI are untouched. OpenCode 2.x loads plugins in a background service. After you change the plugin, run `opencode service restart`.
+The gate only affects agents. Your own terminal never gets the git variables, and the repos' git hooks and CI are untouched. OpenCode 2.x loads plugins in a background service. After you change the plugin, run `opencode service restart`.
 
 ## Commands
 
