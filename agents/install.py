@@ -91,9 +91,14 @@ def unlink(dest, target=None, src=None):
             dest.unlink()
 
 
+def shared_links():
+    """Links every agent uses."""
+    return [(SRC / "review", HOME / ".agents/review", None)] + \
+        [(SRC / "skills" / s, HOME / ".agents/skills" / s, None) for s in SKILLS]
+
+
 def links(agents):
-    out = [(SRC / "review", HOME / ".agents/review", None)]
-    out += [(SRC / "skills" / s, HOME / ".agents/skills" / s, None) for s in SKILLS]
+    out = []
     if "claude" in agents:
         out += [(None, HOME / ".claude/skills" / s, f"../../.agents/skills/{s}") for s in SKILLS]
         out.append((SRC / "claude/hooks/unslop-context.sh", HOME / ".claude/hooks/unslop-context.sh", None))
@@ -146,6 +151,8 @@ def claude_hooks():
 
 def merge_claude_settings(uninstall):
     path = HOME / ".claude/settings.json"
+    if uninstall and not path.exists():
+        return
     data, newline = read_json(path, {})
     if data is None:
         say("skip", f"{rel(path)} is not valid JSON; add the hooks by hand (see agents/README.md)")
@@ -181,6 +188,8 @@ def cursor_hooks():
 
 def merge_cursor_hooks(uninstall):
     path = HOME / ".cursor/hooks.json"
+    if uninstall and not path.exists():
+        return
     data, newline = read_json(path, {"version": 1, "hooks": {}})
     if data is None:
         say("skip", f"{rel(path)} is not valid JSON; add the hooks by hand (see agents/README.md)")
@@ -204,6 +213,8 @@ def merge_opencode(uninstall):
     base = HOME / ".config/opencode"
     path = next((p for p in (base / "opencode.jsonc", base / "opencode.json") if p.exists()),
                 base / "opencode.jsonc")
+    if uninstall and not path.exists():
+        return
     ours = [str(HOME / ".agents/skills/unslop/SKILL.md"), str(HOME / ".agents/review/RULES.md"), str(LOCAL_RULES)]
     data, newline = read_json(path, {"$schema": "https://opencode.ai/config.json"})
     if data is None:
@@ -212,20 +223,27 @@ def merge_opencode(uninstall):
         return
     before = json.loads(json.dumps(data))
     instr = data.setdefault("instructions", [])
+    # OpenCode allows `permission` and `permission.skill` to be a plain action string
+    # such as "allow". Only an object can hold a per-skill rule.
+    perm = data.get("permission", {})
+    skill = perm.get("skill", {}) if isinstance(perm, dict) else None
     if uninstall:
         data["instructions"] = [i for i in instr if i not in ours]
         if not data["instructions"]:
             del data["instructions"]
-        perm = data.get("permission", {})
-        if perm.get("skill", {}).get("show-me") == "ask":
-            del perm["skill"]["show-me"]
-            if not perm["skill"]:
+        if isinstance(skill, dict) and skill.get("show-me") == "ask":
+            del skill["show-me"]
+            if not skill:
                 del perm["skill"]
             if not perm:
                 del data["permission"]
     else:
         instr += [i for i in ours if i not in instr]
-        data.setdefault("permission", {}).setdefault("skill", {}).setdefault("show-me", "ask")
+        if isinstance(skill, dict):
+            data.setdefault("permission", perm).setdefault("skill", skill).setdefault("show-me", "ask")
+        else:
+            say("skip", f'{rel(path)} sets permission as a string; set permission.skill["show-me"] to "ask" '
+                "by hand if you want /show-me to ask first")
     write_json(path, data, newline, before if path.exists() else None)
 
 
@@ -304,7 +322,11 @@ def main():
           + (" (dry run)" if DRY else ""))
 
     print("Links")
-    for src, dest, target in links(agents):
+    # On a partial uninstall, keep the shared links while another installed agent uses them.
+    others = sorted(set(detect_agents()) - set(agents)) if a.uninstall else []
+    if others:
+        print(f"  {'keep':<8} ~/.agents/review and ~/.agents/skills links, still used by {', '.join(others)}")
+    for src, dest, target in ([] if others else shared_links()) + links(agents):
         (unlink if a.uninstall else link)(dest, target=target, src=src)
 
     print("Config")

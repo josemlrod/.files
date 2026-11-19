@@ -17,7 +17,7 @@ This file and the reviewer prompts are the same on every machine. Each machine c
 ~/.agents/review/bin/review info
 ```
 
-It prints JSON. Keep it: you pass parts of it to the reviewers. If `local_pre_pr` is set, read that file now and apply it on top of the steps below. Read these fields:
+It prints JSON. Keep it: you pass parts of it to the reviewers. If `local_pre_pr` is set, read that file now and apply it on top of the steps below. `round_dir` is a new folder for this round's files; it starts with `findings.json` and `rejected.json` set to `[]`. Read these fields:
 
 - `rethink: true` means 3 rounds in a row failed. Stop. Tell the user, list the open findings, and suggest a different approach. Do not run another round unless the user says to.
 - `mode`:
@@ -42,7 +42,7 @@ Pass the remaining open findings to the reviewers as `known_findings` so nobody 
 
 Read `verify_md`. Run every check whose "When" matches the changed files, scoped to those files when the command allows it. For UI or behavior changes, follow its "Manual and UI checks" section. Never run anything its "Not runnable locally" section or the repo docs say touches production.
 
-For each check, keep the command, the exit code, and the last lines of output. Build this JSON and save it to a temp file:
+For each check, keep the command, the exit code, and the last lines of output. Build this JSON and save it to `<round_dir>/checks.json`:
 
 ```json
 {"ok": true, "results": [
@@ -102,19 +102,22 @@ Merge the arrays the reviewers return and tag each item with `"reviewer": "<name
 
 If there are candidates, start one more fresh subagent with `<reviewers_dir>/verify-findings.md` (plus the local `_shared.md` and `verify-findings.md` additions, as in step 5), the same `root`, `merge_base`, and `review_md`, and the merged array. Keep only what it confirms.
 
-Save the candidates it rejected as a JSON array to `/tmp/pre-pr-rejected.json`: `{"reviewer": "...", "class": "...", "file": "...", "title": "...", "reason": "..."}`. Match each `rejected:` line to its candidate to fill in the reviewer, class, and file. These are the false positives the retro uses to tune the reviewers, so keep the verifier's reason.
+Save the candidates it rejected as a JSON array to `<round_dir>/rejected.json`: `{"reviewer": "...", "class": "...", "file": "...", "title": "...", "reason": "..."}`. Match each `rejected:` line to its candidate to fill in the reviewer, class, and file. These are the false positives the retro uses to tune the reviewers, so keep the verifier's reason.
 
 Set the final severity:
 
 - `in_diff: false` becomes `"severity": "pre-existing"`. It never blocks, so the author isn't held responsible for old bugs.
 - Otherwise use the verifier's `important` or `nit`.
 
+Save the confirmed findings, with their final severity, as a JSON array to `<round_dir>/findings.json`. Leave `findings.json` or `rejected.json` as `[]` when there is nothing to put in it.
+
 ## 7. Record the round
 
 ```bash
-~/.agents/review/bin/review record --findings /tmp/pre-pr-findings.json --checks /tmp/pre-pr-checks.json \
-  --rejected /tmp/pre-pr-rejected.json --reviewers bugs:diff,bugs:system,security [--tier high]
+~/.agents/review/bin/review record --reviewers bugs:diff,bugs:system,security [--tier high]
 ```
+
+It reads `findings.json`, `checks.json`, and `rejected.json` from the round's `round_dir`.
 
 `--reviewers` lists the reviewers that ran, as `name` or `name:focus`. `--tier` is only needed when you raised it. The output says `pass` or `fail`. A round passes when the checks passed and no `important` finding is open. Nits never block.
 

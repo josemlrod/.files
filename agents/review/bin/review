@@ -198,9 +198,12 @@ def cmd_info(a):
     st = load_state(repo)
     base = a.base
     if not base:
-        r = subprocess.run(["gh", "pr", "view", "--json", "baseRefName", "-q", ".baseRefName"],
-                           cwd=repo.root, capture_output=True, text=True, timeout=20)
-        base = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else repo.default_branch()
+        try:
+            r = subprocess.run(["gh", "pr", "view", "--json", "baseRefName", "-q", ".baseRefName"],
+                               cwd=repo.root, capture_output=True, text=True, timeout=20)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            r = None  # gh missing or slow: fall back to the default branch
+        base = r.stdout.strip() if r and r.returncode == 0 and r.stdout.strip() else repo.default_branch()
     if not a.no_fetch:
         git("fetch", "origin", base, "--quiet", cwd=repo.root, check=False, timeout=120)
     base_ref = f"origin/{base}" if git("rev-parse", "--verify", "--quiet", f"origin/{base}",
@@ -240,7 +243,11 @@ def cmd_info(a):
 
     docs = [d for d in ("CLAUDE.md", "AGENTS.md", "REVIEW.md") if (Path(repo.root) / d).exists()]
     st["root"], st["slug"] = repo.root, repo.slug
+    round_dir = Path(tempfile.mkdtemp(prefix=f"pre-pr-{repo.name}-"))
+    for name in ("findings.json", "rejected.json"):
+        (round_dir / name).write_text("[]\n")
     st["pending"] = {"tree": tree, "merge_base": merge_base, "base": base, "tier": tier,
+                     "round_dir": str(round_dir),
                      "mode": mode, "files": files, "changed_files": changed, "lines": lines,
                      "ts": now()}
     save_state(repo, st)
@@ -263,6 +270,7 @@ def cmd_info(a):
         "local_reviewers": sorted(p.name for p in LOCAL_REVIEWERS_DIR.glob("*.md")),
         "local_pre_pr": str(LOCAL_PRE_PR) if LOCAL_PRE_PR.exists() else None,
         "state_file": str(repo.state_path),
+        "round_dir": str(round_dir),
         "retro_due": retro_due(),
     }
     if not review_path:
@@ -311,6 +319,12 @@ def cmd_record(a):
     pending = st.get("pending")
     if not pending:
         sys.exit("No pending review. Run `review info` first.")
+    round_dir = Path(pending.get("round_dir") or tempfile.gettempdir())
+    a.findings = a.findings or str(round_dir / "findings.json")
+    a.checks = a.checks or str(round_dir / "checks.json")
+    a.rejected = a.rejected or str(round_dir / "rejected.json")
+    if not Path(a.checks).exists() and a.checks != "-":
+        sys.exit(f"No checks file at {a.checks}. Write the check results there first.")
     findings = read_json_arg(a.findings) or []
     checks = read_json_arg(a.checks) if a.checks else None
     if checks is None or "ok" not in checks:
@@ -321,7 +335,8 @@ def cmd_record(a):
             sys.exit(f"Tier can be raised, not lowered (computed: {tier}).")
         tier = a.tier
 
-    rejected = (read_json_arg(a.rejected) if a.rejected else None) or []
+    rejected = (read_json_arg(a.rejected) if a.rejected and (a.rejected == "-" or Path(a.rejected).exists())
+                else None) or []
     reviewers = [r.strip() for r in (a.reviewers or "").split(",") if r.strip()]
     version = prompt_version()
     rnd = len(st["rounds"]) + 1
@@ -389,9 +404,11 @@ def cmd_outcome(a):
         f.update(status="resolved", outcome=a.outcome, reason=a.reason)
         log("outcome", repo, id=fid, severity=f["severity"], file=f["file"], outcome=a.outcome,
             reason=a.reason, reviewer=f.get("reviewer", ""), **{"class": f["class"]})
-    # Resolving the last blocking finding passes the last reviewed tree if its checks passed.
+    # Rejecting, or accepting as intentional, the last blocking finding passes the last
+    # reviewed tree if its checks passed. A fixed finding doesn't: the fix is in newer
+    # code, and only a new round over that code can pass it.
     last = st["rounds"][-1] if st["rounds"] else None
-    if last and last["checks"].get("ok") and not open_findings(st, "important"):
+    if a.outcome != "fixed" and last and last["checks"].get("ok") and not open_findings(st, "important"):
         if last["verdict"] != "pass":
             log("pass", repo, round=last["n"], via="outcome")
         st["last_pass_tree"], st["failed_since_pass"] = last["tree"], 0
@@ -446,7 +463,10 @@ def hours_between(a, b):
 
 
 def gh(*args, timeout=60):
-    r = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=timeout)
+    try:
+        r = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        raise GhError("gh is not installed") from None
     if r.returncode:
         raise GhError(f"gh {' '.join(args[:3])}: {r.stderr.strip()[:300]}")
     return json.loads(r.stdout) if r.stdout.strip() else None
@@ -797,29 +817,114 @@ def cmd_stats(a):
 
 PUSH_RE = re.compile(r"(?:^|[\s;&|(])git(?:\s+-[cC]\s+\S+)*\s+push\b")
 PR_RE = re.compile(r"(?:^|[\s;&|(])gh\s+pr\s+create\b")
-NON_CODE_PUSH_RE = re.compile(r"\s(--delete|-d|--tags)\b|\s:\S")
+HEREDOC_RE = re.compile(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n(.*?^\s*\2\s*$)", re.S | re.M)
+QUOTED_RE = re.compile(r"'[^']*'|\"(?:\\.|[^\"\\])*\"")
+SEGMENT_SEP_RE = re.compile(r"&&|\|\||[;&|\n()]")
+PUSH_VALUE_OPTS = {"-o", "--push-option", "--repo", "--receive-pack", "--exec"}
 
 
 def unquoted(command):
-    """The command with heredoc bodies and quoted strings blanked, so text that only
-    mentions `git push` (commit messages, prompts, grep patterns) doesn't match."""
-    command = re.sub(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n.*?^\s*\2\s*$", " ", command, flags=re.S | re.M)
-    command = re.sub(r"'[^']*'", "''", command)
-    return re.sub(r'"(?:\\.|[^"\\])*"', '""', command)
+    """The command with heredoc bodies and the inside of quoted strings replaced by
+    spaces, so text that only mentions `git push` (commit messages, prompts, grep
+    patterns) doesn't match. Quotes are matched left to right, so an apostrophe
+    inside a double-quoted string stays inside it. The result has the same length
+    as the input, so a span found in it is the same span in the raw command."""
+    def blank(text):
+        return re.sub(r"[^\n]", " ", text)
+    command = HEREDOC_RE.sub(lambda m: m.group(0)[:m.start(3) - m.start(0)] + blank(m.group(3)), command)
+    return QUOTED_RE.sub(lambda m: m.group(0)[0] + " " * (len(m.group(0)) - 2) + m.group(0)[-1], command)
+
+
+def segments(code):
+    """(start, end) spans of the simple commands in `code`, split on ; && || | & ( ) and newlines."""
+    spans, pos = [], 0
+    for m in SEGMENT_SEP_RE.finditer(code):
+        spans.append((pos, m.start()))
+        pos = m.end()
+    spans.append((pos, len(code)))
+    return [(a, b) for a, b in spans if code[a:b].strip()]
+
+
+def words(text):
+    try:
+        return shlex.split(text)
+    except ValueError:
+        return text.split()
+
+
+def resolve_dir(cwd, path):
+    path = os.path.join(cwd, os.path.expanduser(path or "~"))
+    return path if os.path.isdir(path) else None
+
+
+def push_target(ws, cwd):
+    """For a `git ... push ...` command split into words: the directory it runs in
+    and the arguments after `push`, or (cwd, None) when it can't be parsed."""
+    i = next((k for k, w in enumerate(ws) if w == "git" or w.endswith("/git")), None)
+    if i is None:
+        return cwd, None
+    j = i + 1
+    while j < len(ws) and ws[j] != "push":
+        if ws[j] == "-C" and j + 1 < len(ws):
+            cwd = resolve_dir(cwd, ws[j + 1]) or cwd
+            j += 2
+        elif ws[j] == "-c":
+            j += 2
+        else:
+            j += 1
+    return cwd, (ws[j + 1:] if j < len(ws) else None)
+
+
+def pushes_no_code(args):
+    """True when a push's arguments only delete refs or only push tags."""
+    if args is None:
+        return False
+    flags, positional, k = set(), [], 0
+    while k < len(args):
+        a = args[k]
+        if a in PUSH_VALUE_OPTS:
+            k += 2
+            continue
+        if a.startswith("-") and a != "-":
+            flags.add(a.split("=", 1)[0])
+        else:
+            positional.append(a)
+        k += 1
+    refspecs = positional[1:]  # the first positional argument is the remote
+    if flags & {"--all", "--mirror", "--branches"}:
+        return False
+    if flags & {"-d", "--delete"}:
+        return True
+    if refspecs:
+        return all(r.startswith(":") for r in refspecs)
+    return "--tags" in flags
 
 
 def gate(command, cwd):
     """Return None to allow, or a message explaining the block."""
     code = unquoted(command)
-    is_push, is_pr = bool(PUSH_RE.search(code)), bool(PR_RE.search(code))
-    if not (is_push or is_pr) or (DATA / "GATE_OFF").exists():
+    if not (PUSH_RE.search(code) or PR_RE.search(code)) or (DATA / "GATE_OFF").exists():
         return None
-    if is_push and not is_pr and NON_CODE_PUSH_RE.search(command):
-        return None
-    m = re.search(r"git\s+-C\s+(\S+)", command) or \
-        re.search(r"(?:^|[;&|]\s*)cd\s+(\S+)\s*(?:&&|;)", command)
-    if m:
-        cwd = os.path.join(cwd, os.path.expanduser(m.group(1).strip("'\"")))
+    targets, cur = [], cwd
+    for a, b in segments(code):
+        seg_code, ws = code[a:b], words(command[a:b])
+        if ws[:1] == ["cd"]:
+            cur = resolve_dir(cur, ws[1] if len(ws) > 1 else None) or cur
+        elif PR_RE.search(seg_code):
+            targets.append(cur)
+        elif PUSH_RE.search(seg_code):
+            where, args = push_target(ws, cur)
+            if not pushes_no_code(args):
+                targets.append(where)
+    for target in dict.fromkeys(targets):
+        msg = gate_repo(target)
+        if msg:
+            return msg
+    return None
+
+
+def gate_repo(cwd):
+    """Return None if the repo at `cwd` may be pushed, or a message explaining the block."""
     try:
         repo = Repo(cwd)
     except (GitError, FileNotFoundError, NotADirectoryError):
@@ -847,6 +952,8 @@ def gate(command, cwd):
             f"Run the pre-pr skill ({SKILL}), fix or resolve its findings, then retry. "
             "Only if the user explicitly told you to skip review for this push, run "
             f"`{CLI} skip --reason \"<the user's words>\"` and retry.")
+
+
 
 
 def cmd_gate(a):
@@ -939,10 +1046,10 @@ def main():
     s.set_defaults(fn=cmd_info)
 
     s = sub.add_parser("record", help="finish a round with findings and check results")
-    s.add_argument("--findings", required=True, help="JSON file or - for stdin: list of findings")
-    s.add_argument("--checks", required=True, help='JSON file: {"ok": bool, "results": [...]}')
+    s.add_argument("--findings", help="JSON file or - for stdin: list of findings (default: <round_dir>/findings.json)")
+    s.add_argument("--checks", help='JSON file: {"ok": bool, "results": [...]} (default: <round_dir>/checks.json)')
     s.add_argument("--tier", choices=TIERS, help="raise the computed tier")
-    s.add_argument("--rejected", help="JSON file: candidates the verifier rejected, with reason")
+    s.add_argument("--rejected", help="JSON file: candidates the verifier rejected, with reason (default: <round_dir>/rejected.json)")
     s.add_argument("--reviewers", help="comma-separated reviewers that ran, e.g. bugs:diff,security")
     s.set_defaults(fn=cmd_record)
 

@@ -27,7 +27,7 @@ git clone https://github.com/josemlrod/.files.git ~/.files
 
 It sets up whichever of the three agents are installed (or pass `--agents claude,cursor`). Running it again changes nothing. It needs `python3` 3.9+ and `git`, plus `gh` for the PR harvest.
 
-The installer links the files above. In config files that other tools share, it adds only its own entries: hooks in `~/.claude/settings.json` and `~/.cursor/hooks.json`, two `@` imports in `~/.claude/CLAUDE.md`, and `instructions` in `~/.config/opencode/opencode.jsonc`. Anything it replaces or edits is copied to `~/.agents-install-backup/<timestamp>/` first. If `opencode.jsonc` has comments, it prints the lines to add by hand instead of rewriting the file. `--uninstall` removes what it added.
+The installer links the files above. In config files that other tools share, it adds only its own entries: hooks in `~/.claude/settings.json` and `~/.cursor/hooks.json`, two `@` imports in `~/.claude/CLAUDE.md`, and `instructions` plus `permission.skill["show-me"] = "ask"` in `~/.config/opencode/opencode.jsonc`. Anything it replaces or edits is copied to `~/.agents-install-backup/<timestamp>/` first. If `opencode.jsonc` has comments, it prints the lines to add by hand instead of rewriting the file. `--uninstall` removes what it added. With `--agents`, it keeps the shared `~/.agents` links while another installed agent still uses them.
 
 After an install that changes OpenCode, run `opencode service restart`.
 
