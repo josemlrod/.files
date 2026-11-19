@@ -18,7 +18,7 @@ if [ "$hook" = pre-push ]; then
   printf '%s' "${input:+$input$'\n'}" | "$(cd "$(dirname "$0")/.." && pwd)/bin/review" pre-push "$@" || exit 1
 fi
 
-dir=$(env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 git config --get core.hooksPath 2>/dev/null)
+dir=$(env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 git config --get core.hooksPath 2>/dev/null) || true
 case "$dir" in
   "") dir="$(git rev-parse --git-common-dir 2>/dev/null)/hooks" ;;
   "~"/*) dir="$HOME/${dir#\~/}" ;;

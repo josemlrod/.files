@@ -38,14 +38,17 @@ GIT_HOOKS = HOME / ".agents" / "git-hooks"
 DISPATCH = HOME / ".agents" / "review" / "git-hooks" / "_dispatch"
 STUB_NAME = "_run"
 REVIEW_DATA = HOME / "knowledge" / "review"
-# Paths are written in at install time, so a command's HOME, REVIEW_DATA_DIR or
-# BASH_ENV can't change which gate runs or which review data it reads. Test
-# suites often change HOME; with this, hooks keep working and see the real state.
+# Paths are written in at install time, so a command's HOME or REVIEW_DATA_DIR
+# can't change which gate runs or which review data it reads. Test suites often
+# change HOME; with this, hooks keep working and see the real state. Bash startup
+# input (BASH_ENV, ENV, SHELLOPTS, BASHOPTS) is cleared, and `bash -p` also skips
+# exported functions, so a `set -e; export SHELLOPTS` in a calling script can't
+# make every hook fail.
 STUB = f"""#!/bin/sh
 # Written by ~/.files/agents/install.py. Every git hook name here links to this file.
 REVIEW_HOOK_NAME=$(basename "$0") REVIEW_HOOK_DIR=$(cd "$(dirname "$0")" && pwd -P) \\
-  exec /usr/bin/env -u BASH_ENV -u ENV REVIEW_DATA_DIR={shlex.quote(str(REVIEW_DATA))} \\
-  /bin/bash {shlex.quote(str(DISPATCH))} "$@"
+  exec /usr/bin/env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS \\
+  REVIEW_DATA_DIR={shlex.quote(str(REVIEW_DATA))} /bin/bash -p {shlex.quote(str(DISPATCH))} "$@"
 """
 HOOK_NAMES = ("applypatch-msg pre-applypatch post-applypatch pre-commit pre-merge-commit prepare-commit-msg "
               "commit-msg post-commit pre-rebase post-checkout post-merge pre-push pre-receive update "
