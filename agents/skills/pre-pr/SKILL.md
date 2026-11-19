@@ -23,7 +23,7 @@ It prints JSON. Keep it: you pass parts of it to the reviewers. If `local_pre_pr
 - `mode`:
   - `full`: first review of this branch.
   - `incremental`: review only `files_to_review` and only what changed since `incremental_from_tree`.
-  - `already-reviewed`: nothing changed since the last round. If the last round passed, say so and stop. If it failed only on checks, or on findings that step 2 now resolves, rerun the checks (step 3) and go to step 6 with no reviewers. Say in the report that no reviewers ran.
+  - `already-reviewed`: nothing changed since the last round. If the last round passed, say so and stop. If it failed only on checks, or on findings that step 2 now resolves, rerun the checks (step 3) and go to step 6 with no reviewers. Say in the report that no reviewers ran. A finding raised in this same code can't be fixed without changing it: `record` reopens any Important finding marked fixed whose round reviewed the same tree.
 - `tier`: `low`, `medium`, or `high`, computed from the size and the high-risk paths in `review_md`. Raise it in step 4 if needed. Never lower it below the tier the step 4 rules give for the files under review.
 - `open_findings`: findings from earlier rounds that are still open.
 - `review_md`, `verify_md`: the repo's local rules and checks. If they are null, say so in the report and use the repo's obvious lint, type, and test commands.

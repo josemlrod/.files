@@ -370,6 +370,14 @@ def cmd_record(a):
     for fid in new_ids:
         if st["findings"][fid]["severity"] == "pre-existing":
             st["findings"][fid].update(status="resolved", outcome="pre-existing")
+    # An Important finding marked fixed while the code it was found in is unchanged
+    # can't be fixed: reopen it so this round doesn't pass that code.
+    trees = {r["n"]: r["tree"] for r in st["rounds"]}
+    for f in st["findings"].values():
+        if f["severity"] == "important" and f.get("outcome") == "fixed" \
+                and trees.get(f["round"]) == pending["tree"]:
+            f.update(status="open", outcome=None, reason="marked fixed, but the code is unchanged")
+            log("reopened", repo, id=f["id"], reason=f["reason"])
 
     blocking = open_findings(st, "important")
     verdict = "pass" if checks["ok"] and not blocking else "fail"
@@ -822,24 +830,30 @@ def cmd_stats(a):
 # ---------- gate ----------
 
 # The review check runs inside git: agents' shells point core.hooksPath at
-# ../git-hooks through GIT_CONFIG_* environment variables, so git calls
-# `review pre-push` with the exact refs it is about to push, however the push
-# command was written. The pre-tool check below only stops commands that would
-# switch that hook off.
+# ~/.agents/git-hooks (made by install.py) through GIT_CONFIG_* environment
+# variables, so git calls `review pre-push` with the exact refs it is about to push.
+# The pre-tool check below is a best-effort tripwire for commands that would switch
+# that hook off. It reads command text, so a determined rewrite can still get past
+# it, and a command that merely mentions those options next to "push" is blocked.
 
-HOOK_OFF_RE = re.compile(r"--no-verify|hooksPath|GIT_CONFIG_|\benv\s+(?:-\w*[iu]|--ignore-environment|--unset)")
-SETS_GIT_CONFIG_RE = re.compile(r"^\s*(?:export\s+|unset\s+)?GIT_CONFIG_\w*", re.M)
+# --no-veri is the shortest prefix git accepts for --no-verify; config keys and
+# variable names are matched case-insensitively, as git reads them.
+HOOK_OFF_RE = re.compile(r"--no-veri\w*|hookspath|git_config_|"
+                         r"\benv\s+(?:-\w*[iu]|-(?=\s|$)|--ignore-environment|--unset)", re.I)
+SETS_GIT_CONFIG_RE = re.compile(r"^\s*(?:export\s+|unset\s+)?GIT_CONFIG_\w*", re.M | re.I)
 GIT_PUSH_RE = re.compile(r"\bgit\b.*\bpush\b", re.S)
 ZERO_SHA = re.compile(r"^0+$")
 
 
 def gate(command, cwd):
-    """Return a message if a shell command would push while skipping git's pre-push
-    hook, or None. Everything else is left to the hook. It looks for a push and a
+    """Return a message if a shell command looks like it would push while skipping git's
+    pre-push hook, or None. Everything else is left to the hook. It joins backslash
+    line continuations, drops quotes and backslashes, then looks for a push and a
     hook-skipping option on the same line, or a line that sets GIT_CONFIG_* in a
-    command that also pushes, so a file that only mentions them isn't blocked."""
+    command that also pushes."""
     if (DATA / "GATE_OFF").exists() or "push" not in command:
         return None
+    command = re.sub(r"[\"'\\]", "", command.replace("\\\n", " "))
     same_line = any("push" in line and HOOK_OFF_RE.search(line) for line in command.splitlines())
     if not same_line and not (SETS_GIT_CONFIG_RE.search(command) and GIT_PUSH_RE.search(command)):
         return None
@@ -885,15 +899,16 @@ def cmd_pre_push(a):
     if (DATA / "GATE_OFF").exists():
         return
     repo = Repo(os.getcwd())
+    current = repo.branch  # check_push switches repo to each pushed branch in turn
     problems = []
     for line in lines:
         parts = line.split()
         if len(parts) != 4:
             continue
         local_ref, local_sha, remote_ref, remote_sha = parts
-        if ZERO_SHA.match(local_sha) or remote_ref.startswith("refs/tags/") or local_sha == remote_sha:
-            continue  # a delete, a tag, or nothing new
-        branch = local_ref[len("refs/heads/"):] if local_ref.startswith("refs/heads/") else repo.branch
+        if ZERO_SHA.match(local_sha) or not remote_ref.startswith("refs/heads/") or local_sha == remote_sha:
+            continue  # a delete, a tag or other non-branch ref (notes), or nothing new
+        branch = local_ref[len("refs/heads/"):] if local_ref.startswith("refs/heads/") else current
         msg = check_push(repo, branch, local_sha)
         if msg:
             problems.append(msg)

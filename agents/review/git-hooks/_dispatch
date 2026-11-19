@@ -1,20 +1,24 @@
 #!/usr/bin/env bash
-# Every git hook name in this folder links here. Agents' shells point git's
-# core.hooksPath at this folder (through GIT_CONFIG_* environment variables), so
-# git runs this for every hook while an agent works. On pre-push it first runs the
-# review check. Then it runs the repo's own hook, from the hooks folder git would
-# use without the override (husky's .husky/_, .git/hooks, or a global hooksPath).
+# install.py creates ~/.agents/git-hooks with one link per git hook name, all
+# pointing here, and makes that folder read-only. Agents' shells point git's
+# core.hooksPath at it through GIT_CONFIG_* environment variables, so git runs
+# this for each hook while an agent works. On pre-push it first runs the review
+# check. Then it runs the repo's own hook, from the hooks folder git would use
+# without the override (husky's .husky/_, .git/hooks, or a global hooksPath).
 hook=$(basename "$0")
 here=$(cd "$(dirname "$0")" && pwd -P)
+
+# git init runs reference-transaction before the repo is usable: nothing to do yet.
+git rev-parse --git-dir >/dev/null 2>&1 || exit 0
 
 if [ "$hook" = pre-push ]; then
   input=$(cat)
   printf '%s' "${input:+$input$'\n'}" | "$HOME/.agents/review/bin/review" pre-push "$@" || exit 1
 fi
 
-dir=$(env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 git config --get core.hooksPath)
+dir=$(env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 git config --get core.hooksPath 2>/dev/null)
 case "$dir" in
-  "") dir="$(git rev-parse --git-common-dir)/hooks" ;;
+  "") dir="$(git rev-parse --git-common-dir 2>/dev/null)/hooks" ;;
   "~"/*) dir="$HOME/${dir#\~/}" ;;
   /*) ;;
   *) dir="$(git rev-parse --show-toplevel 2>/dev/null || pwd)/$dir" ;;

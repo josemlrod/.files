@@ -6,7 +6,7 @@ Config for the coding agents I use (Claude Code, Cursor, OpenCode): a pre-PR rev
 
 | Folder | What it is | Linked to |
 | --- | --- | --- |
-| `review/` | The review engine: the `review` CLI, reviewer prompts, always-on rules, templates, and `git-hooks/`, which runs the review check on push. See `review/README.md`. | `~/.agents/review` |
+| `review/` | The review engine: the `review` CLI, reviewer prompts, always-on rules, templates, and `git-hooks/_dispatch`, which runs the review check on push. See `review/README.md`. | `~/.agents/review`; the installer also makes a read-only `~/.agents/git-hooks` with one link per git hook name to `_dispatch` |
 | `skills/pre-pr` | Runs a review round before a push: checks, parallel reviewers, a verifier | `~/.agents/skills/pre-pr` |
 | `skills/review-retro` | Measures the reviewers against what happened to PRs, then tunes this machine's local files | `~/.agents/skills/review-retro` |
 | `skills/unslop` | Writing rules applied to all prose an agent writes | `~/.agents/skills/unslop` |

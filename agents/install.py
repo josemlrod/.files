@@ -27,19 +27,29 @@ SKILLS = ["pre-pr", "review-retro", "unslop", "show-me"]
 STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 BACKUP = HOME / ".agents-install-backup" / STAMP
 LOCAL_RULES = HOME / "knowledge" / "review" / "local" / "rules.md"
-# Agents' shells get these variables, which point git's hooks at review/git-hooks.
-# Git then runs the review check on every push, however the command is written,
-# and the dispatcher there still runs each repo's own hooks.
-GIT_HOOKS = HOME / ".agents" / "review" / "git-hooks"
+# Agents' shells get these variables, which point git's hooks at ~/.agents/git-hooks:
+# a read-only folder of links to review/git-hooks/_dispatch, one per hook name. Git
+# then runs the review check on pushes from those shells, and the dispatcher still
+# runs each repo's own hooks. The folder sits outside this repo and is read-only so a
+# hook installer an agent runs (lefthook, pre-commit) fails instead of replacing it.
+GIT_HOOKS = HOME / ".agents" / "git-hooks"
+DISPATCH = HOME / ".agents" / "review" / "git-hooks" / "_dispatch"
+HOOK_NAMES = ("applypatch-msg pre-applypatch post-applypatch pre-commit pre-merge-commit prepare-commit-msg "
+              "commit-msg post-commit pre-rebase post-checkout post-merge pre-push pre-receive update "
+              "proc-receive post-receive post-update reference-transaction push-to-checkout pre-auto-gc "
+              "post-rewrite sendemail-validate fsmonitor-watchman p4-changelist p4-prepare-changelist "
+              "p4-post-changelist p4-pre-submit post-index-change").split()
 GIT_ENV = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.hooksPath", "GIT_CONFIG_VALUE_0": str(GIT_HOOKS)}
+OLD_HOOKS_VALUES = {str(HOME / ".agents" / "review" / "git-hooks")}  # earlier installs pointed here
 ZSHENV = HOME / ".zshenv"
 ZSHENV_START = "# >>> agent review gate (managed by ~/.files/agents/install.py) >>>"
 ZSHENV_END = "# <<< agent review gate <<<"
 ZSHENV_BLOCK = f"""{ZSHENV_START}
-# Cursor and OpenCode agent shells set CURSOR_AGENT or OPENCODE_TERMINAL. In those
-# shells, point git's hooks at the review gate. Your own terminal is unaffected.
-if [ -n "${{CURSOR_AGENT:-}}${{OPENCODE_TERMINAL:-}}" ]; then
-  export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0="$HOME/.agents/review/git-hooks"
+# Cursor's agent shells set CURSOR_AGENT, and OpenCode's bash tool sets
+# OPENCODE_SESSION_ID. In those shells, point git's hooks at the review gate.
+# Your own terminals, including OpenCode's terminal panel, don't set either.
+if [ -n "${{CURSOR_AGENT:-}}${{OPENCODE_SESSION_ID:-}}" ]; then
+  export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0="$HOME/.agents/git-hooks"
 fi
 {ZSHENV_END}
 """
@@ -175,11 +185,12 @@ def merge_claude_settings(uninstall):
         return
     before = json.loads(json.dumps(data))
     env = data.setdefault("env", {})
+    ours = {k: {v} | (OLD_HOOKS_VALUES if k == "GIT_CONFIG_VALUE_0" else set()) for k, v in GIT_ENV.items()}
     if uninstall:
-        for k, v in GIT_ENV.items():
-            if env.get(k) == v:
+        for k in GIT_ENV:
+            if env.get(k) in ours[k]:
                 del env[k]
-    elif any(k in env and env[k] != v for k, v in GIT_ENV.items()):
+    elif any(k in env and env[k] not in ours[k] for k in GIT_ENV):
         say("skip", f"{rel(path)} already sets GIT_CONFIG_* in env; point core.hooksPath at "
             f"{rel(GIT_HOOKS)} by hand so git runs the review check")
     else:
@@ -319,6 +330,52 @@ def merge_claude_md(uninstall):
 
 # ---------------------------------------------------------------- main
 
+def hooks_folder(uninstall):
+    """Make (or remove) ~/.agents/git-hooks: one link per git hook name to _dispatch.
+    The folder and _dispatch are left read-only, so a hook installer that writes to
+    git's hooks folder fails instead of replacing or overwriting the gate. Git
+    replaces _dispatch on pull by unlinking it, which a read-only file allows."""
+    target = str(DISPATCH)
+    wanted = {name: target for name in HOOK_NAMES}
+    if uninstall:
+        if not GIT_HOOKS.is_dir():
+            return
+        say("remove", rel(GIT_HOOKS))
+        if not DRY:
+            GIT_HOOKS.chmod(0o755)
+            for p in GIT_HOOKS.iterdir():
+                if p.is_symlink() and os.readlink(p) == target:
+                    p.unlink()
+            if not any(GIT_HOOKS.iterdir()):
+                GIT_HOOKS.rmdir()
+        return
+    current = {p.name: os.readlink(p) for p in GIT_HOOKS.iterdir() if p.is_symlink()} if GIT_HOOKS.is_dir() else {}
+    extra = [p.name for p in GIT_HOOKS.iterdir() if p.name not in wanted] if GIT_HOOKS.is_dir() else []
+    read_only = GIT_HOOKS.is_dir() and not os.access(GIT_HOOKS, os.W_OK)
+    if current == wanted and not extra and read_only and not os.access(DISPATCH.resolve(), os.W_OK):
+        print(f"  {'ok':<8} {rel(GIT_HOOKS)}")
+        return
+    if extra:
+        say("backup", f"{rel(GIT_HOOKS)}: {', '.join(sorted(extra))} (not ours)")
+    say("update", f"{rel(GIT_HOOKS)} ({len(wanted)} hook links, read-only)")
+    if DRY:
+        return
+    if GIT_HOOKS.is_dir():
+        GIT_HOOKS.chmod(0o755)
+        for name in extra:
+            backup(GIT_HOOKS / name)
+            p = GIT_HOOKS / name
+            shutil.rmtree(p) if p.is_dir() and not p.is_symlink() else p.unlink()
+    GIT_HOOKS.mkdir(parents=True, exist_ok=True)
+    for name in HOOK_NAMES:
+        p = GIT_HOOKS / name
+        if p.is_symlink() or p.exists():
+            p.unlink()
+        os.symlink(target, p)
+    DISPATCH.resolve().chmod(0o555)
+    GIT_HOOKS.chmod(0o555)
+
+
 def merge_zshenv(uninstall):
     """Add or remove the managed block in ~/.zshenv, which zsh reads for every shell,
     including the non-interactive ones Cursor and OpenCode run commands in."""
@@ -379,6 +436,8 @@ def main():
         print(f"  {'keep':<8} ~/.agents/review and ~/.agents/skills links, still used by {', '.join(others)}")
     for src, dest, target in ([] if others else shared_links()) + links(agents):
         (unlink if a.uninstall else link)(dest, target=target, src=src)
+    if not others:
+        hooks_folder(a.uninstall)
 
     print("Config")
     if "claude" in agents:
