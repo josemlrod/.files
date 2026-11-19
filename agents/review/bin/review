@@ -841,21 +841,24 @@ def cmd_stats(a):
 HOOK_OFF_RE = re.compile(r"--no-veri\w*|hookspath|git_config_|"
                          r"\benv\s+(?:-\w*[iu]|-(?=\s|$)|--ignore-environment|--unset)", re.I)
 SETS_GIT_CONFIG_RE = re.compile(r"^\s*(?:export\s+|unset\s+)?GIT_CONFIG_\w*", re.M | re.I)
-GIT_PUSH_RE = re.compile(r"\bgit\b.*\bpush\b", re.S)
+# A push: the word push (not pre-push), or `gh pr create`, which pushes through git.
+PUSH_WORD_RE = re.compile(r"(?<![\w-])push\b|\bpr\s+create\b")
 ZERO_SHA = re.compile(r"^0+$")
 
 
 def gate(command, cwd):
     """Return a message if a shell command looks like it would push while skipping git's
-    pre-push hook, or None. Everything else is left to the hook. It joins backslash
-    line continuations, drops quotes and backslashes, then looks for a push and a
-    hook-skipping option on the same line, or a line that sets GIT_CONFIG_* in a
-    command that also pushes."""
-    if (DATA / "GATE_OFF").exists() or "push" not in command:
+    pre-push hook, or None. Everything else is left to the hook. Like the shell, it
+    first drops backslash-newline, then drops quotes and backslashes. Then it looks for
+    a push and a hook-skipping option on the same line, or a line that sets
+    GIT_CONFIG_* in a command that also pushes."""
+    if (DATA / "GATE_OFF").exists():
         return None
-    command = re.sub(r"[\"'\\]", "", command.replace("\\\n", " "))
-    same_line = any("push" in line and HOOK_OFF_RE.search(line) for line in command.splitlines())
-    if not same_line and not (SETS_GIT_CONFIG_RE.search(command) and GIT_PUSH_RE.search(command)):
+    command = re.sub(r"[\"'\\]", "", command.replace("\\\n", ""))
+    if not PUSH_WORD_RE.search(command):
+        return None
+    same_line = any(PUSH_WORD_RE.search(line) and HOOK_OFF_RE.search(line) for line in command.splitlines())
+    if not same_line and not SETS_GIT_CONFIG_RE.search(command):
         return None
     return ("Pre-PR review gate blocked this command: it would skip git's pre-push hook, which "
             "runs the review check (--no-verify, a core.hooksPath override, or changed "

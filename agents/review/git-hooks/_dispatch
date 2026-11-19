@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# install.py creates ~/.agents/git-hooks with one link per git hook name, all
-# pointing here, and makes that folder read-only. Agents' shells point git's
-# core.hooksPath at it through GIT_CONFIG_* environment variables, so git runs
-# this for each hook while an agent works. On pre-push it first runs the review
-# check. Then it runs the repo's own hook, from the hooks folder git would use
-# without the override (husky's .husky/_, .git/hooks, or a global hooksPath).
-hook=$(basename "$0")
-here=$(cd "$(dirname "$0")" && pwd -P)
+# install.py creates a read-only ~/.agents/git-hooks: a read-only stub, _run, and
+# one link to it per git hook name. The stub runs this file with REVIEW_HOOK_NAME
+# and REVIEW_HOOK_DIR set. Agents' shells point git's core.hooksPath at that folder
+# through GIT_CONFIG_* environment variables, so git runs this for each hook while
+# an agent works. On pre-push it first runs the review check. Then it runs the
+# repo's own hook, from the hooks folder git would use without the override
+# (husky's .husky/_, .git/hooks, or a global hooksPath).
+hook=${REVIEW_HOOK_NAME:-$(basename "$0")}
+here=${REVIEW_HOOK_DIR:-$(cd "$(dirname "$0")" && pwd -P)}
 
 # git init runs reference-transaction before the repo is usable: nothing to do yet.
 git rev-parse --git-dir >/dev/null 2>&1 || exit 0

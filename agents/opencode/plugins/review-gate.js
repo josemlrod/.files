@@ -12,9 +12,13 @@ const EDIT_TOOLS = new Set(["edit", "write", "multiedit"]);
 const DEBUG = process.env.REVIEW_PLUGIN_DEBUG;
 const dbg = (...a) => DEBUG && fs.appendFileSync(DEBUG, JSON.stringify(a) + "\n");
 
+// Cheap test before calling the CLI. Drops backslash-newline, quotes, and
+// backslashes first, as the shell would, so `pu''sh` still counts as push.
+const mayPush = (command) => /push|\bpr\b/.test((command ?? "").replace(/\\\n/g, "").replace(/["'\\]/g, ""));
+
 // Returns the block message, or undefined to allow.
 function gate(command, cwd) {
-  if (!/push|\bpr\b/.test(command ?? "")) return;
+  if (!mayPush(command)) return;
   const r = spawnSync(CLI, ["--cwd", cwd, "gate", "--command", command], {
     encoding: "utf8",
     timeout: 30000,
@@ -44,7 +48,7 @@ export default {
       dbg("before", e.tool, e.input);
       if (!SHELL_TOOLS.has(e.tool)) return;
       const command = e.input?.command;
-      if (!/push|\bpr\b/.test(command ?? "")) return;
+      if (!mayPush(command)) return;
       const msg = gate(command, await sessionDir(ctx, e, e.input?.workdir));
       if (msg) throw new Error(msg);
     });

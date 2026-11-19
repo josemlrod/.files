@@ -28,12 +28,19 @@ STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 BACKUP = HOME / ".agents-install-backup" / STAMP
 LOCAL_RULES = HOME / "knowledge" / "review" / "local" / "rules.md"
 # Agents' shells get these variables, which point git's hooks at ~/.agents/git-hooks:
-# a read-only folder of links to review/git-hooks/_dispatch, one per hook name. Git
-# then runs the review check on pushes from those shells, and the dispatcher still
-# runs each repo's own hooks. The folder sits outside this repo and is read-only so a
-# hook installer an agent runs (lefthook, pre-commit) fails instead of replacing it.
+# a read-only folder holding a read-only stub, _run, and one link to it per hook name.
+# The stub runs review/git-hooks/_dispatch, which runs the review check on pushes and
+# then each repo's own hooks. Git never rewrites the stub, so a hook installer an
+# agent runs (lefthook, pre-commit, simple-git-hooks) can't rename, add, or write
+# through anything there: it fails instead of replacing the gate.
 GIT_HOOKS = HOME / ".agents" / "git-hooks"
 DISPATCH = HOME / ".agents" / "review" / "git-hooks" / "_dispatch"
+STUB_NAME = "_run"
+STUB = """#!/bin/sh
+# Written by ~/.files/agents/install.py. Every git hook name here links to this file.
+REVIEW_HOOK_NAME=$(basename "$0") REVIEW_HOOK_DIR=$(cd "$(dirname "$0")" && pwd -P) \\
+  exec "$HOME/.agents/review/git-hooks/_dispatch" "$@"
+"""
 HOOK_NAMES = ("applypatch-msg pre-applypatch post-applypatch pre-commit pre-merge-commit prepare-commit-msg "
               "commit-msg post-commit pre-rebase post-checkout post-merge pre-push pre-receive update "
               "proc-receive post-receive post-update reference-transaction push-to-checkout pre-auto-gc "
@@ -331,12 +338,13 @@ def merge_claude_md(uninstall):
 # ---------------------------------------------------------------- main
 
 def hooks_folder(uninstall):
-    """Make (or remove) ~/.agents/git-hooks: one link per git hook name to _dispatch.
-    The folder and _dispatch are left read-only, so a hook installer that writes to
-    git's hooks folder fails instead of replacing or overwriting the gate. Git
-    replaces _dispatch on pull by unlinking it, which a read-only file allows."""
-    target = str(DISPATCH)
-    wanted = {name: target for name in HOOK_NAMES}
+    """Make (or remove) ~/.agents/git-hooks: a read-only stub, _run, and one link to it
+    per git hook name, in a read-only folder. Git never touches the stub, so nothing
+    a hook installer does can replace or write through to the gate."""
+    stub = GIT_HOOKS / STUB_NAME
+    dispatch = DISPATCH.resolve()
+    if dispatch.exists() and not os.access(dispatch, os.W_OK) and not DRY:
+        dispatch.chmod(0o755)  # an earlier install made the repo file read-only
     if uninstall:
         if not GIT_HOOKS.is_dir():
             return
@@ -344,35 +352,43 @@ def hooks_folder(uninstall):
         if not DRY:
             GIT_HOOKS.chmod(0o755)
             for p in GIT_HOOKS.iterdir():
-                if p.is_symlink() and os.readlink(p) == target:
+                if (p.is_symlink() and os.readlink(p) in (STUB_NAME, str(DISPATCH))) or \
+                        (p == stub and p.read_text() == STUB):
+                    p.chmod(0o755) if not p.is_symlink() else None
                     p.unlink()
             if not any(GIT_HOOKS.iterdir()):
                 GIT_HOOKS.rmdir()
         return
-    current = {p.name: os.readlink(p) for p in GIT_HOOKS.iterdir() if p.is_symlink()} if GIT_HOOKS.is_dir() else {}
-    extra = [p.name for p in GIT_HOOKS.iterdir() if p.name not in wanted] if GIT_HOOKS.is_dir() else []
-    read_only = GIT_HOOKS.is_dir() and not os.access(GIT_HOOKS, os.W_OK)
-    if current == wanted and not extra and read_only and not os.access(DISPATCH.resolve(), os.W_OK):
+    entries = {p.name: p for p in GIT_HOOKS.iterdir()} if GIT_HOOKS.is_dir() else {}
+    links_ok = all(entries.get(n) and entries[n].is_symlink() and os.readlink(entries[n]) == STUB_NAME
+                   for n in HOOK_NAMES)
+    stub_ok = stub.is_file() and not stub.is_symlink() and stub.read_text() == STUB and not os.access(stub, os.W_OK)
+    extra = sorted(set(entries) - set(HOOK_NAMES) - {STUB_NAME})
+    if links_ok and stub_ok and not extra and not os.access(GIT_HOOKS, os.W_OK):
         print(f"  {'ok':<8} {rel(GIT_HOOKS)}")
         return
     if extra:
-        say("backup", f"{rel(GIT_HOOKS)}: {', '.join(sorted(extra))} (not ours)")
-    say("update", f"{rel(GIT_HOOKS)} ({len(wanted)} hook links, read-only)")
+        say("backup", f"{rel(GIT_HOOKS)}: {', '.join(extra)} (not ours)")
+    say("update", f"{rel(GIT_HOOKS)} ({len(HOOK_NAMES)} hook links to a read-only stub)")
     if DRY:
         return
     if GIT_HOOKS.is_dir():
         GIT_HOOKS.chmod(0o755)
         for name in extra:
-            backup(GIT_HOOKS / name)
             p = GIT_HOOKS / name
+            backup(p)
             shutil.rmtree(p) if p.is_dir() and not p.is_symlink() else p.unlink()
     GIT_HOOKS.mkdir(parents=True, exist_ok=True)
+    if stub.exists() or stub.is_symlink():
+        stub.chmod(0o755) if not stub.is_symlink() else None
+        stub.unlink()
+    stub.write_text(STUB)
+    stub.chmod(0o555)
     for name in HOOK_NAMES:
         p = GIT_HOOKS / name
         if p.is_symlink() or p.exists():
             p.unlink()
-        os.symlink(target, p)
-    DISPATCH.resolve().chmod(0o555)
+        os.symlink(STUB_NAME, p)
     GIT_HOOKS.chmod(0o555)
 
 
