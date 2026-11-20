@@ -5,7 +5,9 @@
 # through GIT_CONFIG_* environment variables, so git runs this for each hook while
 # an agent works. On pre-push it first runs the review check. Then it runs the
 # repo's own hook, from the hooks folder git would use without the override
-# (husky's .husky/_, .git/hooks, or a global hooksPath).
+# (husky's .husky/_, .git/hooks, or a global hooksPath). The repo hook runs without
+# the override too, so a hook manager that asks git for core.hooksPath (overcommit
+# does, to update itself) sees the repo's own setting and not this folder.
 hook=${REVIEW_HOOK_NAME:-$(basename "$0")}
 here=${REVIEW_HOOK_DIR:-$(cd "$(dirname "$0")" && pwd -P)}
 
@@ -18,7 +20,11 @@ if [ "$hook" = pre-push ]; then
   printf '%s' "${input:+$input$'\n'}" | "$(cd "$(dirname "$0")/.." && pwd)/bin/review" pre-push "$@" || exit 1
 fi
 
-dir=$(env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 git config --get core.hooksPath 2>/dev/null) || true
+# From here on, drop the agent override: the lookup below and the repo hook (with
+# any git commands it runs) see the repo's own hooks path.
+unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
+
+dir=$(git config --get core.hooksPath 2>/dev/null) || true
 case "$dir" in
   "") dir="$(git rev-parse --git-common-dir 2>/dev/null)/hooks" ;;
   "~"/*) dir="$HOME/${dir#\~/}" ;;
