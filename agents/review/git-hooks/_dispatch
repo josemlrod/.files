@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# install.py creates a read-only ~/.agents/git-hooks: a read-only stub, _run, and
+# one link to it per git hook name. The stub runs this file with REVIEW_HOOK_NAME
+# and REVIEW_HOOK_DIR set. Agents' shells point git's core.hooksPath at that folder
+# through GIT_CONFIG_* environment variables, so git runs this for each hook while
+# an agent works. On pre-push it first runs the review check. Then it runs the
+# repo's own hook, from the hooks folder git would use without the override
+# (husky's .husky/_, .git/hooks, or a global hooksPath). The repo hook runs without
+# the override too, so a hook manager that asks git for core.hooksPath (overcommit
+# does, to update itself) sees the repo's own setting and not this folder.
+hook=${REVIEW_HOOK_NAME:-$(basename "$0")}
+here=${REVIEW_HOOK_DIR:-$(cd "$(dirname "$0")" && pwd -P)}
+
+# git init runs reference-transaction before the repo is usable: nothing to do yet.
+git rev-parse --git-dir >/dev/null 2>&1 || exit 0
+
+if [ "$hook" = pre-push ]; then
+  input=$(cat)
+  # The CLI sits next to this folder; don't rely on $HOME, which a command may change.
+  printf '%s' "${input:+$input$'\n'}" | "$(cd "$(dirname "$0")/.." && pwd)/bin/review" pre-push "$@" || exit 1
+fi
+
+# From here on, drop the agent override: the lookup below and the repo hook (with
+# any git commands it runs) see the repo's own hooks path.
+unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
+
+dir=$(git config --get core.hooksPath 2>/dev/null) || true
+case "$dir" in
+  "") dir="$(git rev-parse --git-common-dir 2>/dev/null)/hooks" ;;
+  "~"/*) dir="$HOME/${dir#\~/}" ;;
+  /*) ;;
+  *) dir="$(git rev-parse --show-toplevel 2>/dev/null || pwd)/$dir" ;;
+esac
+target="$dir/$hook"
+# Don't call ourselves if the repo's own setting also points here.
+[ -d "$dir" ] && [ "$(cd "$dir" && pwd -P)" = "$here" ] && exit 0
+[ -x "$target" ] || exit 0
+
+if [ "$hook" = pre-push ]; then
+  printf '%s' "${input:+$input$'\n'}" | "$target" "$@"
+  exit $?
+fi
+exec "$target" "$@"

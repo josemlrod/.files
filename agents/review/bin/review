@@ -1,0 +1,1071 @@
+#!/usr/bin/env python3
+"""Local pre-PR review: per-branch state, push/PR gate, edit formatter, hook adapters.
+
+Data lives in ~/knowledge/review (override with REVIEW_DATA_DIR):
+  <repo>/REVIEW.md, <repo>/verify.md   per-repo rules and checks
+  state/<repo>/<branch>.json           review rounds and findings per branch
+  log.jsonl                            one line per round, finding, outcome, skip
+  local/rules.md                       this machine's agent rules, loaded after RULES.md
+  local/reviewers/<name>.md            this machine's additions to a reviewer prompt
+  local/pre-pr.md                      this machine's changes to the pre-pr flow
+  GATE_OFF                             if this file exists, the gate allows everything
+
+The engine (this file, reviewers/, the skills) comes from the .files repo and
+is the same on every machine. Tuning from a retro goes to local/ and stays here.
+
+Run `review --help` for commands. Standard library only.
+"""
+import argparse
+import datetime
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+DATA = Path(os.environ.get("REVIEW_DATA_DIR", Path.home() / "knowledge" / "review"))
+STATE_DIR = DATA / "state"
+LOG = DATA / "log.jsonl"
+FORMAT_LOG = DATA / "format.log"
+HARVEST_LOG = DATA / "harvest.log"
+HARVEST_STAMP = DATA / ".harvest-stamp"
+PRS_DIR = DATA / "prs"
+EVALS = DATA / "evals" / "cases.jsonl"
+REVIEWERS_DIR = Path(__file__).resolve().parent.parent / "reviewers"
+LOCAL_DIR = DATA / "local"
+LOCAL_REVIEWERS_DIR = LOCAL_DIR / "reviewers"
+LOCAL_PRE_PR = LOCAL_DIR / "pre-pr.md"
+SKILL = Path.home() / ".agents" / "skills" / "pre-pr" / "SKILL.md"
+SELF = Path(__file__).resolve()
+CLI = Path(__file__).absolute()  # the path it was called by, e.g. ~/.agents/review/bin/review
+
+MAX_FAILED_ROUNDS = 3
+SEVERITIES = ("important", "nit", "pre-existing")
+OUTCOMES = ("fixed", "rejected", "intentional", "ignored")
+TIERS = ("low", "medium", "high")
+HIGH_LINES, LOW_LINES, LOW_FILES = 600, 100, 5
+
+
+class GitError(Exception):
+    pass
+
+
+class GhError(Exception):
+    pass
+
+
+def now():
+    return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def git(*args, cwd, check=True, env=None, timeout=60):
+    r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True,
+                       env=env, timeout=timeout)
+    if check and r.returncode:
+        raise GitError(f"git {' '.join(args)}: {r.stderr.strip()}")
+    return r.stdout.strip()
+
+
+# ---------- globs and per-repo config ----------
+
+def glob_re(glob):
+    out, i = "", 0
+    while i < len(glob):
+        if glob.startswith("**/", i):
+            out, i = out + "(?:.*/)?", i + 3
+        elif glob.startswith("**", i):
+            out, i = out + ".*", i + 2
+        elif glob[i] == "*":
+            out, i = out + "[^/]*", i + 1
+        elif glob[i] == "?":
+            out, i = out + "[^/]", i + 1
+        elif glob[i] == "{" and "}" in glob[i:]:
+            j = glob.index("}", i)
+            out += "(?:" + "|".join(re.escape(p) for p in glob[i + 1:j].split(",")) + ")"
+            i = j + 1
+        elif glob[i] == "[" and "]" in glob[i:]:
+            j = glob.index("]", i)
+            out, i = out + glob[i:j + 1], j + 1
+        else:
+            out, i = out + re.escape(glob[i]), i + 1
+    return re.compile("^" + out + "$")
+
+
+def matches(path, globs):
+    return any(glob_re(g).match(path) for g in globs)
+
+
+def section(text, heading):
+    """Lines of a '## heading' section, without HTML comments."""
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.S)
+    m = re.search(rf"^## {re.escape(heading)}\s*$(.*?)(?=^## |\Z)", text, flags=re.M | re.S)
+    return m.group(1).splitlines() if m else []
+
+
+def section_globs(text, heading):
+    return [m.group(1) for line in section(text, heading)
+            if (m := re.match(r"^\s*- `([^`]+)`\s*$", line))]
+
+
+def format_rules(text):
+    return [(m.group(1), m.group(2)) for line in section(text, "Format")
+            if (m := re.match(r"^\s*- `([^`]+)`:\s*`([^`]+)`", line))]
+
+
+# ---------- repo and state ----------
+
+class Repo:
+    def __init__(self, cwd):
+        self.root = git("rev-parse", "--show-toplevel", cwd=cwd)
+        url = git("remote", "get-url", "origin", cwd=self.root, check=False)
+        name = url.rstrip("/").replace(":", "/").split("/")[-1] if url else Path(self.root).name
+        self.name = re.sub(r"\.git$", "", name)
+        m = re.search(r"github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?/?$", url or "")
+        self.slug = f"{m.group(1)}/{m.group(2)}" if m else None
+        branch = git("rev-parse", "--abbrev-ref", "HEAD", cwd=self.root, check=False)
+        if branch in ("", "HEAD"):
+            branch = "detached-" + (git("rev-parse", "--verify", "--quiet", "--short", "HEAD",
+                                       cwd=self.root, check=False) or "nohead")
+        self.config_dir = DATA / self.name
+        self.use_branch(branch)
+
+    def use_branch(self, branch):
+        """Point this Repo at another branch's review state."""
+        self.branch = branch
+        self.state_path = STATE_DIR / self.name / (branch.replace("/", "__") + ".json")
+
+    def config(self, filename):
+        p = self.config_dir / filename
+        return (p, p.read_text()) if p.exists() else (None, "")
+
+    def head_tree(self):
+        return git("rev-parse", "--verify", "--quiet", "HEAD^{tree}", cwd=self.root, check=False)
+
+    def worktree_tree(self):
+        """Tree object for the working tree, untracked files included, without touching the real index."""
+        idx = git("rev-parse", "--git-path", "index", cwd=self.root)
+        idx = idx if os.path.isabs(idx) else os.path.join(self.root, idx)
+        with tempfile.TemporaryDirectory() as d:
+            tmp = os.path.join(d, "index")
+            if os.path.exists(idx):
+                shutil.copy(idx, tmp)
+            env = {**os.environ, "GIT_INDEX_FILE": tmp}
+            git("add", "-A", cwd=self.root, env=env, timeout=120)
+            return git("write-tree", cwd=self.root, env=env)
+
+    def default_branch(self):
+        ref = git("symbolic-ref", "--short", "refs/remotes/origin/HEAD", cwd=self.root, check=False)
+        return ref.split("/", 1)[1] if ref else "main"
+
+
+def load_state(repo):
+    if repo.state_path.exists():
+        return json.loads(repo.state_path.read_text())
+    return {"repo": repo.name, "branch": repo.branch, "rounds": [], "findings": {},
+            "last_reviewed_tree": None, "last_pass_tree": None, "failed_since_pass": 0,
+            "skip_tree": None, "pending": None}
+
+
+def save_state(repo, st):
+    repo.state_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = repo.state_path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(st, indent=2) + "\n")
+    tmp.replace(repo.state_path)
+
+
+def log(event, repo, **fields):
+    DATA.mkdir(parents=True, exist_ok=True)
+    with LOG.open("a") as f:
+        f.write(json.dumps({"ts": now(), "event": event, "repo": repo.name,
+                            "branch": repo.branch, **fields}) + "\n")
+
+
+def open_findings(st, severity=None):
+    return [f for f in st["findings"].values()
+            if f["status"] == "open" and (severity is None or f["severity"] == severity)]
+
+
+def read_json_arg(value):
+    raw = sys.stdin.read() if value == "-" else Path(value).read_text()
+    return json.loads(raw) if raw.strip() else None
+
+
+# ---------- commands: review flow ----------
+
+def cmd_info(a):
+    repo = Repo(a.cwd)
+    st = load_state(repo)
+    base = a.base
+    if not base:
+        try:
+            r = subprocess.run(["gh", "pr", "view", "--json", "baseRefName", "-q", ".baseRefName"],
+                               cwd=repo.root, capture_output=True, text=True, timeout=20)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            r = None  # gh missing or slow: fall back to the default branch
+        base = r.stdout.strip() if r and r.returncode == 0 and r.stdout.strip() else repo.default_branch()
+    if not a.no_fetch:
+        git("fetch", "origin", base, "--quiet", cwd=repo.root, check=False, timeout=120)
+    base_ref = f"origin/{base}" if git("rev-parse", "--verify", "--quiet", f"origin/{base}",
+                                       cwd=repo.root, check=False) else base
+    merge_base = git("merge-base", "HEAD", base_ref, cwd=repo.root)
+    tree = repo.worktree_tree()
+
+    review_path, review_text = repo.config("REVIEW.md")
+    verify_path, _ = repo.config("verify.md")
+    ignored_globs = section_globs(review_text, "Ignored paths")
+    high_globs = section_globs(review_text, "High-risk paths")
+
+    all_files = [f for f in git("diff", "--name-only", merge_base, tree, cwd=repo.root).splitlines() if f]
+    lines = 0
+    for row in git("diff", "--numstat", merge_base, tree, cwd=repo.root).splitlines():
+        added, removed, _ = row.split("\t", 2)
+        lines += (int(added) if added.isdigit() else 0) + (int(removed) if removed.isdigit() else 0)
+    files = [f for f in all_files if not matches(f, ignored_globs)]
+    high_risk = [f for f in all_files if matches(f, high_globs)]
+
+    if high_risk or lines > HIGH_LINES:
+        tier = "high"
+    elif lines <= LOW_LINES and len(all_files) <= LOW_FILES:
+        tier = "low"
+    else:
+        tier = "medium"
+
+    last = st.get("last_reviewed_tree")
+    if last and last == tree:
+        mode, changed = "already-reviewed", []
+    elif last and subprocess.run(["git", "cat-file", "-e", last], cwd=repo.root,
+                                 capture_output=True).returncode == 0:
+        since = set(git("diff", "--name-only", last, tree, cwd=repo.root).splitlines())
+        mode, changed = "incremental", [f for f in files if f in since]
+    else:
+        mode, changed = "full", files
+
+    docs = [d for d in ("CLAUDE.md", "AGENTS.md", "REVIEW.md") if (Path(repo.root) / d).exists()]
+    st["root"], st["slug"] = repo.root, repo.slug
+    round_dir = Path(tempfile.mkdtemp(prefix=f"pre-pr-{repo.name}-"))
+    for name in ("findings.json", "rejected.json"):
+        (round_dir / name).write_text("[]\n")
+    st["pending"] = {"tree": tree, "merge_base": merge_base, "base": base, "tier": tier,
+                     "round_dir": str(round_dir),
+                     "mode": mode, "files": files, "changed_files": changed, "lines": lines,
+                     "ts": now()}
+    save_state(repo, st)
+
+    out = {
+        "repo": repo.name, "root": repo.root, "branch": repo.branch, "base": base_ref,
+        "merge_base": merge_base, "tree": tree, "round": len(st["rounds"]) + 1,
+        "mode": mode, "incremental_from_tree": last if mode == "incremental" else None,
+        "files": files, "files_to_review": changed if mode == "incremental" else files,
+        "ignored_files": [f for f in all_files if f not in files],
+        "lines_changed": lines, "tier": tier, "high_risk_files": high_risk,
+        "review_md": str(review_path) if review_path else None,
+        "verify_md": str(verify_path) if verify_path else None,
+        "repo_docs": docs,
+        "open_findings": open_findings(st),
+        "failed_rounds_since_pass": st["failed_since_pass"],
+        "rethink": st["failed_since_pass"] >= MAX_FAILED_ROUNDS,
+        "reviewers_dir": str(SELF.parent.parent / "reviewers"),
+        "local_reviewers_dir": str(LOCAL_REVIEWERS_DIR),
+        "local_reviewers": sorted(p.name for p in LOCAL_REVIEWERS_DIR.glob("*.md")),
+        "local_pre_pr": str(LOCAL_PRE_PR) if LOCAL_PRE_PR.exists() else None,
+        "state_file": str(repo.state_path),
+        "round_dir": str(round_dir),
+        "retro_due": retro_due(),
+    }
+    if not review_path:
+        out["note"] = (f"No {repo.config_dir}/REVIEW.md. Copy ~/.agents/review/templates/REVIEW.md "
+                       "and verify.md there to give reviewers repo rules.")
+    print(json.dumps(out, indent=2))
+    start_background_harvest()
+
+
+def retro_due():
+    """True when the last retro is old enough and enough rounds have been logged since."""
+    last = max((p.stem[:10] for p in RETROS_DIR.glob("*.md")), default=None) if RETROS_DIR.exists() else None
+    since = datetime.datetime.fromisoformat(last).replace(tzinfo=datetime.timezone.utc) if last else None
+    if since and (datetime.datetime.now(datetime.timezone.utc) - since).days < RETRO_AFTER_DAYS:
+        return False
+    if not LOG.exists():
+        return False
+    rounds = 0
+    for line in LOG.open():
+        e = json.loads(line)
+        if e["event"] == "round" and (not since or parse_ts(e["ts"]) >= since):
+            rounds += 1
+    return rounds >= RETRO_AFTER_ROUNDS
+
+
+def cmd_version(a):
+    print(prompt_version())
+
+
+def prompt_version():
+    """Short hash of the reviewer prompts and the pre-pr skill, plus this machine's
+    local additions to both, to compare tuning changes."""
+    h = hashlib.sha256()
+    for p in sorted(REVIEWERS_DIR.glob("*.md")) + [SKILL]:
+        if p.exists():
+            h.update(p.name.encode() + p.read_bytes())
+    for p in sorted(LOCAL_REVIEWERS_DIR.glob("*.md")) + [LOCAL_PRE_PR]:
+        if p.exists():
+            h.update(b"local/" + p.name.encode() + p.read_bytes())
+    return h.hexdigest()[:10]
+
+
+def cmd_record(a):
+    repo = Repo(a.cwd)
+    st = load_state(repo)
+    pending = st.get("pending")
+    if not pending:
+        sys.exit("No pending review. Run `review info` first.")
+    round_dir = Path(pending.get("round_dir") or tempfile.gettempdir())
+    a.findings = a.findings or str(round_dir / "findings.json")
+    a.checks = a.checks or str(round_dir / "checks.json")
+    a.rejected = a.rejected or str(round_dir / "rejected.json")
+    if not Path(a.checks).exists() and a.checks != "-":
+        sys.exit(f"No checks file at {a.checks}. Write the check results there first.")
+    findings = read_json_arg(a.findings) or []
+    checks = read_json_arg(a.checks) if a.checks else None
+    if checks is None or "ok" not in checks:
+        sys.exit('--checks must be JSON with an "ok" boolean and a "results" list.')
+    tier = pending["tier"]
+    if a.tier:
+        if TIERS.index(a.tier) < TIERS.index(tier):
+            sys.exit(f"Tier can be raised, not lowered (computed: {tier}).")
+        tier = a.tier
+
+    rejected = (read_json_arg(a.rejected) if a.rejected and (a.rejected == "-" or Path(a.rejected).exists())
+                else None) or []
+    reviewers = [r.strip() for r in (a.reviewers or "").split(",") if r.strip()]
+    version = prompt_version()
+    rnd = len(st["rounds"]) + 1
+    next_id = len(st["findings"]) + 1
+    new_ids = []
+    for f in findings:
+        sev = f.get("severity", "").lower()
+        if sev not in SEVERITIES:
+            sys.exit(f"Bad severity {sev!r} in {f}. Use one of {SEVERITIES}.")
+        if not f.get("file") or not f.get("title"):
+            sys.exit(f"Each finding needs file and title: {f}")
+        fid = f"F{next_id}"
+        next_id += 1
+        st["findings"][fid] = {
+            "id": fid, "round": rnd, "severity": sev, "file": f["file"], "line": f.get("line"),
+            "class": f.get("class", ""), "title": f["title"], "detail": f.get("detail", ""),
+            "fix": f.get("fix", ""), "reviewer": f.get("reviewer", ""), "status": "open",
+            "outcome": None, "reason": None,
+        }
+        new_ids.append(fid)
+        log("finding", repo, tier=tier, prompt_version=version,
+            **{k: v for k, v in st["findings"][fid].items() if k not in ("status", "outcome", "reason")})
+    for r in rejected:
+        log("rejected", repo, round=rnd, tier=tier, prompt_version=version,
+            **{k: r.get(k, "") for k in ("reviewer", "class", "file", "title", "reason")})
+    # Pre-existing findings are informational: they never block and need no outcome.
+    for fid in new_ids:
+        if st["findings"][fid]["severity"] == "pre-existing":
+            st["findings"][fid].update(status="resolved", outcome="pre-existing")
+    # An Important finding marked fixed while the code it was found in is unchanged
+    # can't be fixed: reopen it so this round doesn't pass that code.
+    trees = {r["n"]: r["tree"] for r in st["rounds"]}
+    for f in st["findings"].values():
+        if f["severity"] == "important" and f.get("outcome") == "fixed" \
+                and trees.get(f["round"]) == pending["tree"]:
+            f.update(status="open", outcome=None, reason="marked fixed, but the code is unchanged")
+            log("reopened", repo, id=f["id"], reason=f["reason"])
+
+    blocking = open_findings(st, "important")
+    verdict = "pass" if checks["ok"] and not blocking else "fail"
+    st["rounds"].append({"n": rnd, "ts": now(), "tree": pending["tree"],
+                         "merge_base": pending["merge_base"], "tier": tier, "mode": pending["mode"],
+                         "files": pending["changed_files"] if pending["mode"] == "incremental" else pending["files"],
+                         "lines": pending["lines"], "checks": checks, "new_findings": new_ids,
+                         "rejected": len(rejected), "reviewers": reviewers,
+                         "prompt_version": version, "verdict": verdict})
+    st["last_reviewed_tree"] = pending["tree"]
+    if verdict == "pass":
+        st["last_pass_tree"], st["failed_since_pass"] = pending["tree"], 0
+    else:
+        st["failed_since_pass"] += 1
+    st["pending"] = None
+    save_state(repo, st)
+    log("round", repo, round=rnd, tier=tier, mode=pending["mode"], lines=pending["lines"],
+        checks_ok=checks["ok"], new_findings=len(new_ids), open_important=len(blocking),
+        rejected=len(rejected), reviewers=reviewers, prompt_version=version, verdict=verdict)
+    print(json.dumps({"round": rnd, "verdict": verdict, "tier": tier, "new_findings": new_ids,
+                      "open_important": [f["id"] for f in blocking],
+                      "open_nits": [f["id"] for f in open_findings(st, "nit")],
+                      "failed_rounds_since_pass": st["failed_since_pass"],
+                      "rethink": st["failed_since_pass"] >= MAX_FAILED_ROUNDS}, indent=2))
+
+
+def cmd_outcome(a):
+    repo = Repo(a.cwd)
+    st = load_state(repo)
+    if a.outcome != "fixed" and not a.reason:
+        sys.exit(f"--reason is required for {a.outcome}.")
+    for fid in a.ids:
+        f = st["findings"].get(fid)
+        if not f:
+            sys.exit(f"No finding {fid} on {repo.name}/{repo.branch}.")
+        f.update(status="resolved", outcome=a.outcome, reason=a.reason, resolved_after_round=len(st["rounds"]))
+        log("outcome", repo, id=fid, severity=f["severity"], file=f["file"], outcome=a.outcome,
+            reason=a.reason, reviewer=f.get("reviewer", ""), **{"class": f["class"]})
+    # Resolving the last blocking finding passes the last reviewed tree if its checks
+    # passed, unless an important finding was marked fixed after that round: the fix
+    # is in newer code, and only a new round over that code can pass it.
+    last = st["rounds"][-1] if st["rounds"] else None
+    fixed_in_last = [f for f in st["findings"].values() if f["severity"] == "important"
+                     and f.get("outcome") == "fixed" and last and f.get("resolved_after_round") == last["n"]]
+    if last and last["checks"].get("ok") and not open_findings(st, "important") and not fixed_in_last:
+        if last["verdict"] != "pass":
+            log("pass", repo, round=last["n"], via="outcome")
+        st["last_pass_tree"], st["failed_since_pass"] = last["tree"], 0
+        last["verdict"] = "pass"
+    save_state(repo, st)
+    print(json.dumps({"resolved": a.ids, "open_important": [f["id"] for f in open_findings(st, "important")],
+                      "passed_tree": st["last_pass_tree"]}, indent=2))
+
+
+def cmd_skip(a):
+    repo = Repo(a.cwd)
+    st = load_state(repo)
+    st["skip_tree"] = repo.head_tree()
+    save_state(repo, st)
+    log("skip", repo, tree=st["skip_tree"], reason=a.reason)
+    print(f"Gate skipped once for {repo.name}/{repo.branch} at tree {st['skip_tree'][:10]}. "
+          "Any new commit needs a review again.")
+
+
+def cmd_status(a):
+    repo = Repo(a.cwd)
+    st = load_state(repo)
+    head = repo.head_tree()
+    print(f"{repo.name} / {repo.branch}")
+    print(f"  rounds: {len(st['rounds'])}, failed since last pass: {st['failed_since_pass']}")
+    print(f"  HEAD tree passed review: {'yes' if head and head == st['last_pass_tree'] else 'no'}")
+    for f in open_findings(st):
+        print(f"  open {f['id']} [{f['severity']}] {f['file']}:{f.get('line') or '?'} {f['title']}")
+
+
+# ---------- harvest: what happened to reviewed branches on GitHub ----------
+
+HARVEST_EVERY_HOURS = 20
+RETROS_DIR = DATA / "retros"
+RETRO_AFTER_DAYS, RETRO_AFTER_ROUNDS = 14, 10
+REVERT_WATCH_DAYS = 30
+STALE_DAYS = 90
+BODY_LIMIT = 1500
+FAILED = {"FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "ERROR", "STARTUP_FAILURE"}
+
+
+def parse_ts(s):
+    return datetime.datetime.fromisoformat(s.replace("Z", "+00:00")) if s else None
+
+
+def age_days(ts):
+    return (datetime.datetime.now(datetime.timezone.utc) - parse_ts(ts)).total_seconds() / 86400
+
+
+def hours_between(a, b):
+    return round((parse_ts(b) - parse_ts(a)).total_seconds() / 3600, 1) if a and b else None
+
+
+def gh(*args, timeout=60):
+    try:
+        r = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        raise GhError("gh is not installed") from None
+    if r.returncode:
+        raise GhError(f"gh {' '.join(args[:3])}: {r.stderr.strip()[:300]}")
+    return json.loads(r.stdout) if r.stdout.strip() else None
+
+
+def gh_pages(path):
+    pages = gh("api", path, "--paginate", "--slurp") or []
+    return [item for page in pages for item in (page if isinstance(page, list) else [page])]
+
+
+def start_background_harvest():
+    """Run `harvest --auto` detached so a pre-pr round never waits on GitHub."""
+    try:
+        DATA.mkdir(parents=True, exist_ok=True)
+        with HARVEST_LOG.open("a") as err:
+            subprocess.Popen([sys.executable, str(SELF), "harvest", "--auto"], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=err, start_new_session=True)
+    except OSError:
+        pass
+
+
+def classify(login, user_type, me):
+    if user_type == "Bot" or login.endswith("[bot]") or login.lower() in ("copilot", "claude", "github-actions"):
+        return "bot"
+    return "me" if login == me else "human"
+
+
+def pr_comments(slug, n, me):
+    out = []
+    for r in gh_pages(f"repos/{slug}/pulls/{n}/reviews"):
+        u = r.get("user") or {}
+        out.append({"kind": "review", "author": u.get("login", ""),
+                    "who": classify(u.get("login", ""), u.get("type"), me), "state": r.get("state"),
+                    "body": (r.get("body") or "")[:BODY_LIMIT], "at": r.get("submitted_at")})
+    for c in gh_pages(f"repos/{slug}/pulls/{n}/comments"):
+        u = c.get("user") or {}
+        out.append({"kind": "inline", "author": u.get("login", ""),
+                    "who": classify(u.get("login", ""), u.get("type"), me), "path": c.get("path"),
+                    "line": c.get("line") or c.get("original_line"), "reply": bool(c.get("in_reply_to_id")),
+                    "body": (c.get("body") or "")[:BODY_LIMIT], "at": c.get("created_at")})
+    for c in gh_pages(f"repos/{slug}/issues/{n}/comments"):
+        u = c.get("user") or {}
+        out.append({"kind": "conversation", "author": u.get("login", ""),
+                    "who": classify(u.get("login", ""), u.get("type"), me),
+                    "body": (c.get("body") or "")[:BODY_LIMIT], "at": c.get("created_at")})
+    return sorted(out, key=lambda c: c["at"] or "")
+
+
+def find_reverts(slug, pr):
+    n, title = pr["number"], pr["title"]
+    sha = ((pr.get("mergeCommit") or {}).get("oid") or "")[:7]
+    found = {}
+    for query in (f"{slug}#{n}", f'"Revert \\"{title[:80]}\\""'):
+        try:
+            hits = gh("search", "prs", query, "--repo", slug, "--json", "number,title,url,body,state",
+                      "--limit", "10")
+        except GhError:
+            continue
+        for h in hits or []:
+            body = h.get("body") or ""
+            if h["number"] != n and h["title"].lower().startswith("revert") and (
+                    f"#{n}" in body or title in h["title"] or (sha and sha in body)):
+                found[h["number"]] = {"number": h["number"], "url": h["url"], "title": h["title"],
+                                      "state": h["state"]}
+    return list(found.values())
+
+
+def harvest_branch(path, me):
+    st = json.loads(path.read_text())
+    h = dict(st.get("harvest") or {})
+    if h.get("done") or not st.get("slug") or not st.get("rounds"):
+        return None
+    slug, branch = st["slug"], st["branch"]
+    if branch.startswith("detached-"):
+        h["done"] = True
+        return h, st
+    if not h.get("pr"):
+        prs = gh("pr", "list", "-R", slug, "--head", branch, "--state", "all",
+                 "--json", "number,createdAt", "--limit", "5") or []
+        if not prs:
+            if age_days(st["rounds"][-1]["ts"]) > STALE_DAYS:
+                h["done"] = True
+            return h, st
+        h["pr"] = max(prs, key=lambda p: p["createdAt"])["number"]
+    n = h["pr"]
+    pr = gh("pr", "view", str(n), "-R", slug, "--json",
+            "number,url,title,state,isDraft,createdAt,mergedAt,closedAt,additions,deletions,"
+            "mergeCommit,statusCheckRollup,author")
+    comments = pr_comments(slug, n, me)
+    others = [c for c in comments if c["who"] == "human"]
+    human_notes = [c for c in others if c["body"].strip()]
+    checks = pr.get("statusCheckRollup") or []
+    failed = sorted({c.get("name") or c.get("context") or "?" for c in checks
+                     if (c.get("conclusion") or c.get("state") or "").upper() in FAILED})
+    reviews_by_others = [c for c in others if c["kind"] in ("review", "inline")]
+    metrics = {
+        "human_comments": len(human_notes),
+        "bot_comments": len([c for c in comments if c["who"] == "bot" and c["body"].strip()]),
+        "approvals": len({c["author"] for c in others if c.get("state") == "APPROVED"}),
+        "changes_requested": len([c for c in others if c.get("state") == "CHANGES_REQUESTED"]),
+        "hours_to_first_human_review": hours_between(
+            pr["createdAt"], min((c["at"] for c in reviews_by_others if c["at"]), default=None)),
+        "hours_to_merge": hours_between(pr["createdAt"], pr.get("mergedAt")),
+        "failed_checks": failed,
+        "size": (pr.get("additions") or 0) + (pr.get("deletions") or 0),
+    }
+    record = {"repo": st["repo"], "slug": slug, "branch": branch, "number": n, "url": pr["url"],
+              "title": pr["title"], "state": pr["state"], "created_at": pr["createdAt"],
+              "merged_at": pr.get("mergedAt"), "closed_at": pr.get("closedAt"),
+              "merge_commit": (pr.get("mergeCommit") or {}).get("oid"),
+              "rounds": len(st["rounds"]), "last_verdict": st["rounds"][-1]["verdict"],
+              "metrics": metrics, "comments": comments, "harvested_at": now()}
+
+    events = []
+    if pr["state"] in ("MERGED", "CLOSED") and not h.get("final_logged"):
+        h["final_logged"] = True
+        events.append(("pr", {"pr": n, "url": pr["url"], "state": pr["state"], "rounds": len(st["rounds"]),
+                              **{k: v for k, v in metrics.items()}}))
+        if pr["state"] == "MERGED":
+            for f in st["findings"].values():
+                if f["status"] == "open":
+                    f.update(status="resolved", outcome="open-at-merge")
+                    events.append(("outcome", {"id": f["id"], "severity": f["severity"], "file": f["file"],
+                                               "outcome": "open-at-merge", "reason": None,
+                                               "reviewer": f.get("reviewer", ""), "class": f["class"]}))
+    if pr["state"] == "MERGED":
+        known = {r["number"] for r in h.get("reverts", [])}
+        for r in find_reverts(slug, pr):
+            if r["number"] not in known:
+                h.setdefault("reverts", []).append(r)
+                events.append(("revert", {"pr": n, "revert_pr": r["number"], "revert_url": r["url"]}))
+                EVALS.parent.mkdir(parents=True, exist_ok=True)
+                with EVALS.open("a") as f:
+                    f.write(json.dumps({"ts": now(), "repo": st["repo"], "slug": slug, "pr": n, "url": pr["url"],
+                                        "merge_commit": record["merge_commit"], "revert": r,
+                                        "state_file": str(path)}) + "\n")
+        if age_days(pr["mergedAt"]) > REVERT_WATCH_DAYS:
+            h["done"] = True
+    elif pr["state"] == "CLOSED":
+        h["done"] = True
+    record["reverts"] = h.get("reverts", [])
+    out = PRS_DIR / st["repo"] / f"{n}.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(record, indent=2) + "\n")
+    h["last"] = now()
+    return h, st, events
+
+
+def cmd_harvest(a):
+    if a.auto and HARVEST_STAMP.exists() and \
+            (datetime.datetime.now().timestamp() - HARVEST_STAMP.stat().st_mtime) < HARVEST_EVERY_HOURS * 3600:
+        return
+    DATA.mkdir(parents=True, exist_ok=True)
+    HARVEST_STAMP.touch()
+    try:
+        me = gh("api", "user")["login"]
+    except (GhError, TypeError, subprocess.TimeoutExpired) as e:
+        print(f"{now()} harvest: gh unavailable: {e}", file=sys.stderr)
+        return
+    done = 0
+    for path in sorted(STATE_DIR.glob("*/*.json")):
+        try:
+            result = harvest_branch(path, me)
+        except (GhError, subprocess.TimeoutExpired, KeyError, ValueError) as e:
+            print(f"{now()} harvest {path.name}: {e}", file=sys.stderr)
+            continue
+        if not result:
+            continue
+        h, st = result[0], result[1]
+        events = result[2] if len(result) > 2 else []
+        # Re-read before writing so a pre-pr round that ran meanwhile isn't overwritten.
+        fresh = json.loads(path.read_text())
+        fresh["harvest"] = h
+        for fid, f in st["findings"].items():
+            if f.get("outcome") == "open-at-merge" and fid in fresh["findings"] and \
+                    fresh["findings"][fid]["status"] == "open":
+                fresh["findings"][fid].update(status="resolved", outcome="open-at-merge")
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(fresh, indent=2) + "\n")
+        tmp.replace(path)
+        for event, fields in events:
+            with LOG.open("a") as f:
+                f.write(json.dumps({"ts": now(), "event": event, "repo": st["repo"],
+                                    "branch": st["branch"], **fields}) + "\n")
+        done += 1
+    if not a.auto:
+        print(json.dumps({"branches_checked": done, "prs_dir": str(PRS_DIR), "evals": str(EVALS)}))
+
+
+# ---------- stats for review-retro ----------
+
+def median(xs):
+    xs = sorted(x for x in xs if x is not None)
+    return xs[len(xs) // 2] if xs else None
+
+
+def p95(xs):
+    xs = sorted(x for x in xs if x is not None)
+    return xs[min(len(xs) - 1, int(len(xs) * 0.95))] if xs else None
+
+
+def cmd_stats(a):
+    since = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=a.days)
+    in_period = lambda ts: ts and parse_ts(ts) >= since
+    states = [json.loads(p.read_text()) for p in sorted(STATE_DIR.glob("*/*.json"))]
+    states = [s for s in states if not a.repo or s["repo"] == a.repo]
+    events = [json.loads(l) for l in LOG.open()] if LOG.exists() else []
+    events = [e for e in events if in_period(e["ts"]) and (not a.repo or e["repo"] == a.repo)]
+
+    rounds, findings, branches = [], [], []
+    for s in states:
+        rs = [r for r in s["rounds"] if in_period(r["ts"])]
+        if not rs:
+            continue
+        rounds += [{**r, "repo": s["repo"]} for r in rs]
+        first_pass = next((r["n"] for r in s["rounds"] if r["verdict"] == "pass"), None)
+        streak = worst = 0
+        for r in s["rounds"]:
+            streak = streak + 1 if r["verdict"] == "fail" else 0
+            worst = max(worst, streak)
+        branches.append({"repo": s["repo"], "branch": s["branch"], "rounds": len(s["rounds"]),
+                         "cycles_to_pass": first_pass, "worst_fail_streak": worst,
+                         "pr": (s.get("harvest") or {}).get("pr")})
+        round_ts = {r["n"]: r["ts"] for r in s["rounds"]}
+        round_pv = {r["n"]: r.get("prompt_version") for r in s["rounds"]}
+        for f in s["findings"].values():
+            if in_period(round_ts.get(f["round"])):
+                findings.append({**f, "repo": s["repo"], "branch": s["branch"],
+                                 "prompt_version": round_pv.get(f["round"])})
+
+    def outcome_of(f):
+        o = f.get("outcome")
+        if f["status"] == "open":
+            return "open"
+        return "dismissed" if o in ("rejected", "intentional", "ignored") else o
+
+    def group(key):
+        out = {}
+        for f in findings:
+            if f["severity"] == "pre-existing":
+                continue
+            g = out.setdefault((f.get(key) or "?").lower(), {"n": 0, "important": 0, "fixed": 0, "dismissed": 0,
+                                                             "open-at-merge": 0, "open": 0})
+            g["n"] += 1
+            g["important"] += f["severity"] == "important"
+            o = outcome_of(f)
+            if o in g:
+                g[o] += 1
+        for g in out.values():
+            settled = g["fixed"] + g["dismissed"] + g["open-at-merge"]
+            g["noise_rate"] = round((g["dismissed"] + g["open-at-merge"]) / settled, 2) if settled else None
+        return dict(sorted(out.items(), key=lambda kv: -kv[1]["n"]))
+
+    rejected = [e for e in events if e["event"] == "rejected"]
+    by_reviewer = group("reviewer")
+    for e in rejected:
+        g = by_reviewer.setdefault((e.get("reviewer") or "?").lower(), {"n": 0})
+        g["verifier_rejected"] = g.get("verifier_rejected", 0) + 1
+
+    versions = {}
+    for r in rounds:
+        v = versions.setdefault(r.get("prompt_version") or "?", {"rounds": 0, "findings": 0, "important": 0,
+                                                                 "dismissed": 0, "fixed": 0,
+                                                                 "verifier_rejected": 0, "first_ts": r["ts"]})
+        v["rounds"] += 1
+        v["verifier_rejected"] += r.get("rejected", 0)
+    for f in findings:
+        v = versions.get(f.get("prompt_version") or "?")
+        if v and f["severity"] != "pre-existing":
+            v["findings"] += 1
+            v["important"] += f["severity"] == "important"
+            o = outcome_of(f)
+            v["dismissed"] += o in ("dismissed", "open-at-merge")
+            v["fixed"] += o == "fixed"
+
+    prs = []
+    for p in sorted(PRS_DIR.glob("*/*.json")):
+        d = json.loads(p.read_text())
+        if (not a.repo or d["repo"] == a.repo) and in_period(d["created_at"]):
+            prs.append({**d, "file": str(p)})
+    pm = [d["metrics"] for d in prs]
+
+    dismissed = sorted([f for f in findings if outcome_of(f) == "dismissed"],
+                       key=lambda f: f.get("round", 0), reverse=True)
+    fixed_classes = {}
+    for f in findings:
+        if outcome_of(f) == "fixed":
+            fixed_classes.setdefault((f.get("class") or "?").lower(), []).append(f"{f['repo']}: {f['title']}")
+
+    print(json.dumps({
+        "period_days": a.days, "repo": a.repo,
+        "rounds": {
+            "total": len(rounds),
+            "by_tier": {t: sum(r["tier"] == t for r in rounds) for t in TIERS},
+            "by_mode": {m: sum(r["mode"] == m for r in rounds) for m in ("full", "incremental", "already-reviewed")},
+            "pass": sum(r["verdict"] == "pass" for r in rounds),
+            "checks_failed": sum(not r["checks"].get("ok") for r in rounds),
+            "findings_per_round_by_tier": {
+                t: round(sum(len(r["new_findings"]) for r in rounds if r["tier"] == t) /
+                         max(1, sum(r["tier"] == t for r in rounds)), 2) for t in TIERS},
+            "verifier_rejected": sum(r.get("rejected", 0) for r in rounds),
+        },
+        "branches": {
+            "total": len(branches),
+            "passed": sum(b["cycles_to_pass"] is not None for b in branches),
+            "cycles_to_pass_median": median(b["cycles_to_pass"] for b in branches),
+            "cycles_to_pass_p95": p95(b["cycles_to_pass"] for b in branches),
+            "hit_rethink": [f"{b['repo']}/{b['branch']}" for b in branches if b["worst_fail_streak"] >= MAX_FAILED_ROUNDS],
+        },
+        "findings": {
+            "total": len(findings),
+            "by_severity": {s: sum(f["severity"] == s for f in findings) for s in SEVERITIES},
+            "by_outcome": {o: sum(outcome_of(f) == o for f in findings)
+                           for o in ("fixed", "dismissed", "open-at-merge", "open", "pre-existing")},
+            "by_class": group("class"),
+            "by_reviewer": by_reviewer,
+            "by_repo": group("repo"),
+        },
+        "prompt_versions": versions,
+        "skips": [{k: e.get(k) for k in ("ts", "repo", "branch", "reason")} for e in events if e["event"] == "skip"],
+        "prs": {
+            "total": len(prs), "merged": sum(d["state"] == "MERGED" for d in prs),
+            "human_comments_median": median(m["human_comments"] for m in pm),
+            "human_comments_total": sum(m["human_comments"] for m in pm),
+            "approvals_median": median(m["approvals"] for m in pm),
+            "approvals_p95": p95(m["approvals"] for m in pm),
+            "hours_to_first_human_review_median": median(m["hours_to_first_human_review"] for m in pm),
+            "hours_to_merge_median": median(m["hours_to_merge"] for m in pm),
+            "with_failed_checks": [{"url": d["url"], "failed": d["metrics"]["failed_checks"]}
+                                   for d in prs if d["metrics"]["failed_checks"]],
+            "reverts_found": [{k: e.get(k) for k in ("ts", "repo", "pr", "revert_pr", "revert_url")}
+                              for e in events if e["event"] == "revert"],
+            "with_human_comments": [{"url": d["url"], "file": d["file"], "n": d["metrics"]["human_comments"]}
+                                    for d in prs if d["metrics"]["human_comments"]],
+        },
+        "examples": {
+            "dismissed": [{k: f.get(k) for k in ("repo", "reviewer", "class", "severity", "file", "title",
+                                                   "outcome", "reason")} for f in dismissed[:25]],
+            "verifier_rejected": [{k: e.get(k) for k in ("repo", "reviewer", "class", "title", "reason")}
+                                  for e in rejected[-25:]],
+            "recurring_fixed_classes": {c: t[:4] for c, t in fixed_classes.items() if len(t) >= 2},
+        },
+        "evals_file": str(EVALS) if EVALS.exists() else None,
+    }, indent=2))
+
+
+# ---------- gate ----------
+
+# The review check runs inside git: agents' shells point core.hooksPath at
+# ~/.agents/git-hooks (made by install.py) through GIT_CONFIG_* environment
+# variables, so git calls `review pre-push` with the exact refs it is about to push.
+# The pre-tool check below is a best-effort tripwire for commands that would switch
+# that hook off. It reads command text, so a determined rewrite can still get past
+# it, and a command that merely mentions those options next to "push" is blocked.
+
+# --no-veri is the shortest prefix git accepts for --no-verify; config keys and
+# variable names are matched case-insensitively, as git reads them.
+HOOK_OFF_RE = re.compile(r"--no-veri\w*|hookspath|git_config_|"
+                         r"\benv\s+(?:-\w*[iu]|-(?=\s|$)|--ignore-environment|--unset)", re.I)
+SETS_GIT_CONFIG_RE = re.compile(r"^\s*(?:export\s+|unset\s+)?GIT_CONFIG_\w*", re.M | re.I)
+# A push: the word push, including git's dashed git-push but not pre-push, or
+# `gh pr create` / `gh pr new`, which push through git.
+PUSH_WORD_RE = re.compile(r"(?<!pre-)(?<!\w)push\b|\bpr\s+(?:create|new)\b")
+ZERO_SHA = re.compile(r"^0+$")
+
+
+def gate(command, cwd):
+    """Return a message if a shell command looks like it would push while skipping git's
+    pre-push hook, or None. Everything else is left to the hook. Like the shell, it
+    first drops backslash-newline, then drops quotes and backslashes. Then it looks for
+    a push and a hook-skipping option on the same line, or a line that sets
+    GIT_CONFIG_* in a command that also pushes."""
+    if (DATA / "GATE_OFF").exists():
+        return None
+    command = re.sub(r"[\"'\\]", "", command.replace("\\\n", ""))
+    if not PUSH_WORD_RE.search(command):
+        return None
+    same_line = any(PUSH_WORD_RE.search(line) and HOOK_OFF_RE.search(line) for line in command.splitlines())
+    if not same_line and not SETS_GIT_CONFIG_RE.search(command):
+        return None
+    return ("Pre-PR review gate blocked this command: it would skip git's pre-push hook, which "
+            "runs the review check (--no-verify, a core.hooksPath override, or changed "
+            "GIT_CONFIG_* variables). Push without those. If the push is blocked, run the "
+            f"pre-pr skill ({SKILL}).")
+
+
+def check_push(repo, branch, sha):
+    """Return None if `sha` on `branch` may be pushed, or a message explaining the block."""
+    tree = git("rev-parse", "--verify", "--quiet", f"{sha}^{{tree}}", cwd=repo.root, check=False)
+    base = git("merge-base", sha, f"origin/{repo.default_branch()}", cwd=repo.root, check=False)
+    if not tree or (base and git("rev-parse", "--verify", "--quiet", f"{base}^{{tree}}",
+                                 cwd=repo.root, check=False) == tree):
+        return None  # nothing new compared with the default branch
+    repo.use_branch(branch)
+    st = load_state(repo)
+    if tree in (st.get("last_pass_tree"), st.get("skip_tree")):
+        return None
+
+    blocking = open_findings(st, "important")
+    if blocking:
+        why = "open Important findings: " + ", ".join(f"{f['id']} {f['title']}" for f in blocking)
+    elif st.get("last_reviewed_tree"):
+        why = ("the code changed since the last review (or the reviewed changes were not all "
+               "committed). Run pre-pr again; it only reviews what changed.")
+    else:
+        why = "this branch has not been reviewed yet."
+    if st["failed_since_pass"] >= MAX_FAILED_ROUNDS:
+        why += (f" {st['failed_since_pass']} review rounds have failed in a row: stop and discuss the "
+                "approach with the user before another round.")
+    return (f"Pre-PR review gate blocked this push for {repo.name}/{branch}: {why}\n"
+            f"Run the pre-pr skill ({SKILL}), fix or resolve its findings, then retry. "
+            "Only if the user explicitly told you to skip review for this push, run "
+            f"`{CLI} skip --reason \"<the user's words>\"` and retry.")
+
+
+def cmd_pre_push(a):
+    """Called by git's pre-push hook. Reads `<local ref> <local sha> <remote ref> <remote sha>`
+    lines on stdin and exits 1 if any pushed branch holds code that hasn't passed review."""
+    lines = sys.stdin.read().splitlines()
+    if (DATA / "GATE_OFF").exists():
+        return
+    repo = Repo(os.getcwd())
+    current = repo.branch  # check_push switches repo to each pushed branch in turn
+    problems = []
+    for line in lines:
+        parts = line.split()
+        if len(parts) != 4:
+            continue
+        local_ref, local_sha, remote_ref, remote_sha = parts
+        if ZERO_SHA.match(local_sha) or not remote_ref.startswith("refs/heads/") or local_sha == remote_sha:
+            continue  # a delete, a tag or other non-branch ref (notes), or nothing new
+        branch = local_ref[len("refs/heads/"):] if local_ref.startswith("refs/heads/") else current
+        msg = check_push(repo, branch, local_sha)
+        if msg:
+            problems.append(msg)
+    if problems:
+        print("\n".join(problems), file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_gate(a):
+    msg = gate(a.command, a.cwd)
+    if msg:
+        print(msg, file=sys.stderr)
+        sys.exit(2)
+
+
+# ---------- formatter ----------
+
+def format_file(path, cwd):
+    path = Path(cwd, os.path.expanduser(path)).resolve()
+    if not path.is_file():
+        return
+    try:
+        repo = Repo(path.parent)
+    except (GitError, FileNotFoundError):
+        return
+    _, verify = repo.config("verify.md")
+    rel = os.path.relpath(path, Path(repo.root).resolve())
+    if rel.startswith(".."):
+        return
+    for glob, command in format_rules(verify):
+        if glob_re(glob).match(rel):
+            if re.match(r"^\s*true\b", command):
+                return
+            cmd = command.replace("{file}", shlex.quote(rel))
+            try:
+                r = subprocess.run(cmd, shell=True, cwd=repo.root, capture_output=True,
+                                   text=True, timeout=45)
+                status = r.returncode
+                err = (r.stderr or r.stdout).strip()[-400:]
+            except subprocess.TimeoutExpired:
+                status, err = "timeout", ""
+            if status != 0:
+                with FORMAT_LOG.open("a") as f:
+                    f.write(json.dumps({"ts": now(), "repo": repo.name, "file": rel,
+                                        "cmd": cmd, "status": status, "err": err}) + "\n")
+            return
+
+
+def cmd_format(a):
+    for p in a.files:
+        format_file(p, a.cwd)
+
+
+# ---------- hook adapters (read the agent's JSON on stdin) ----------
+
+def cmd_hook(a):
+    try:
+        data = json.loads(sys.stdin.read() or "{}")
+    except json.JSONDecodeError:
+        data = {}
+    cwd = data.get("cwd") or (data.get("workspace_roots") or [os.getcwd()])[0]
+    try:
+        if a.kind == "claude-pre":
+            msg = gate((data.get("tool_input") or {}).get("command", ""), cwd)
+            if msg:
+                print(msg, file=sys.stderr)
+                sys.exit(2)
+        elif a.kind == "claude-post":
+            ti = data.get("tool_input") or {}
+            if ti.get("file_path"):
+                format_file(ti["file_path"], cwd)
+        elif a.kind == "cursor-shell":
+            msg = gate(data.get("command", ""), cwd)
+            print(json.dumps({"permission": "deny", "user_message": msg.splitlines()[0],
+                              "agent_message": msg} if msg else {"permission": "allow"}))
+        elif a.kind == "cursor-edit":
+            if data.get("file_path"):
+                format_file(data["file_path"], cwd)
+    except SystemExit:
+        raise
+    except Exception as e:  # never break the agent because of a bug here
+        print(f"review hook error (allowed): {e}", file=sys.stderr)
+        if a.kind == "cursor-shell":
+            print(json.dumps({"permission": "allow"}))
+
+
+def main():
+    p = argparse.ArgumentParser(prog="review", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--cwd", default=os.getcwd(), help="directory inside the repo (default: cwd)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("info", help="start a round: scope, tier, mode, open findings (JSON)")
+    s.add_argument("--base", help="base branch (default: PR base, else origin/HEAD)")
+    s.add_argument("--no-fetch", action="store_true")
+    s.set_defaults(fn=cmd_info)
+
+    s = sub.add_parser("record", help="finish a round with findings and check results")
+    s.add_argument("--findings", help="JSON file or - for stdin: list of findings (default: <round_dir>/findings.json)")
+    s.add_argument("--checks", help='JSON file: {"ok": bool, "results": [...]} (default: <round_dir>/checks.json)')
+    s.add_argument("--tier", choices=TIERS, help="raise the computed tier")
+    s.add_argument("--rejected", help="JSON file: candidates the verifier rejected, with reason (default: <round_dir>/rejected.json)")
+    s.add_argument("--reviewers", help="comma-separated reviewers that ran, e.g. bugs:diff,security")
+    s.set_defaults(fn=cmd_record)
+
+    s = sub.add_parser("outcome", help="resolve findings: fixed, rejected, intentional, ignored")
+    s.add_argument("outcome", choices=OUTCOMES)
+    s.add_argument("ids", nargs="+")
+    s.add_argument("--reason")
+    s.set_defaults(fn=cmd_outcome)
+
+    s = sub.add_parser("skip", help="let the gate pass the current HEAD once (user's request only)")
+    s.add_argument("--reason", required=True)
+    s.set_defaults(fn=cmd_skip)
+
+    s = sub.add_parser("harvest", help="fetch PR outcomes (human comments, CI, reverts) for reviewed branches")
+    s.add_argument("--auto", action="store_true", help="do nothing if a harvest ran in the last 20h")
+    s.set_defaults(fn=cmd_harvest)
+
+    s = sub.add_parser("stats", help="aggregate rounds, findings, outcomes and PR data (JSON) for a retro")
+    s.add_argument("--days", type=int, default=30)
+    s.add_argument("--repo")
+    s.set_defaults(fn=cmd_stats)
+
+    s = sub.add_parser("version", help="print the hash of the current reviewer prompts and pre-pr skill")
+    s.set_defaults(fn=cmd_version)
+
+    s = sub.add_parser("status", help="show review state for the current branch")
+    s.set_defaults(fn=cmd_status)
+
+    s = sub.add_parser("gate", help="exit 2 with a message if COMMAND would skip git's pre-push hook")
+    s.add_argument("--command", required=True)
+    s.set_defaults(fn=cmd_gate)
+
+    s = sub.add_parser("pre-push", help="git pre-push hook: exit 1 if a pushed branch hasn't passed review")
+    s.add_argument("remote", nargs="?")
+    s.add_argument("url", nargs="?")
+    s.set_defaults(fn=cmd_pre_push)
+
+    s = sub.add_parser("format", help="run the repo's formatter from verify.md on files")
+    s.add_argument("files", nargs="+")
+    s.set_defaults(fn=cmd_format)
+
+    s = sub.add_parser("hook", help="adapter for agent hooks; reads the hook JSON on stdin")
+    s.add_argument("kind", choices=("claude-pre", "claude-post", "cursor-shell", "cursor-edit"))
+    s.set_defaults(fn=cmd_hook)
+
+    a = p.parse_args()
+    try:
+        a.fn(a)
+    except GitError as e:
+        sys.exit(str(e))
+
+
+if __name__ == "__main__":
+    main()
